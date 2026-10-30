@@ -1,0 +1,10 @@
+# Boston Dynamics docs: third-party, ~1 GB (files over GitHub's 100 MB limit)
+spot-docs-main/
+spot-docs-main.zip
+
+# Chat transcript exports (keep local)
+notes.zip
+notes/*.zip
+
+__pycache__/
+*.pyc

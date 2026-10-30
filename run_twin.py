@@ -1,0 +1,475 @@
+"""Spot throwing digital twin.
+
+Offline (no hardware):
+  python run_twin.py simulate --duration 1.0 --release-fraction 0.5   # simulated throw record
+  python run_twin.py simulate --start-pose 0 -2.2 3.0 0 0 1.57 --end-pose 0 -1.2 1.8 0 0 1.57
+  python run_twin.py fake-live --live-view                            # live pipeline vs a fake lab
+  python run_twin.py optimize --source sim --target 0.95 0.15         # learn to hit a target
+  python run_twin.py optimize --source fake-live --target 0.95 0.15 --live-view
+  python run_twin.py plan                                             # click a target -> throw
+  python run_twin.py simulate --plan twin_data/plans/plan_*.json      # run an exported plan
+  python run_twin.py analyze twin_data/*.npz                          # print the analysis
+  python run_twin.py view                                             # replay records in 3D
+
+In the lab (PC on the SpotRoom network, Motive streaming unicast, ball =
+single marker, Spot's body = rigid body; see twin/live.py):
+  python run_twin.py calibrate 10.0.0.30 --local-ip <this PC> --body-rb <id>
+  python run_twin.py live 10.0.0.30 --local-ip <this PC> --duration 2 --live-view
+  python run_twin.py optimize --source live --hostname 10.0.0.30 --local-ip <this PC> --target 0.95 0 --live-view
+
+Records go to twin_data/, all in Spot's robot frame (see twin/record.py).
+"""
+
+import argparse
+import contextlib
+import glob
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+from twin import ballistics
+from twin.record import ThrowRecord
+from twin.sources import FakeOptiTrack, SimSource
+from twin.viewer import Viewer, summary_lines
+
+DATA_DIR = Path(__file__).resolve().parent / "twin_data"
+CALIB_FILE = Path(__file__).resolve().parent / "calibration.json"
+FORWARD_THROW = ([0, -2.2, 3.0, 0, 0, 1.57], [0, -1.2, 1.8, 0, 0, 1.57])  # found in simulation
+
+
+def trajectory_from(opts):
+    """--plan file, or custom start/end pose -> cubic joint trajectory;
+    None = spot_throw_safe default. A plan also sets duration, release and target."""
+    if getattr(opts, "plan", None):
+        from twin.planner import load_plan
+        d, traj = load_plan(opts.plan)
+        opts.duration, opts.release_fraction = d["duration"], d["release_fraction"]
+        if opts.target is None:
+            opts.target = d["target"]
+        print(f"plan {opts.plan}: T={opts.duration:.2f} s, release {opts.release_fraction:.2f}, "
+              f"target {np.round(opts.target, 3)}")
+        return traj
+    if opts.start_pose is None and opts.end_pose is None:
+        return None
+    if opts.start_pose is None or opts.end_pose is None:
+        sys.exit("Give both --start-pose and --end-pose.")
+    from throw_trajectory import cubic_joint_trajectory
+    return cubic_joint_trajectory(opts.start_pose, opts.end_pose, opts.duration)
+
+
+def save_record(rec, prefix, opts, i):
+    name = f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_T{opts.duration}_rf{opts.release_fraction}_{i}.npz"
+    path = rec.save(DATA_DIR / name)
+    print(f"saved {path}")
+    return print_analysis(rec)
+
+
+def print_analysis(rec):
+    P = rec.params
+    a = ballistics.analyze(rec, P["ball_radius"], P["ball_mass"], P["drag_coeff"])
+    for line in summary_lines(rec, a):
+        print("  " + line)
+    return a
+
+
+# ---- sessions: fake lab / real lab ---------------------------------------
+# Each yields (robot interface, NatNet client, T_rb_body, rigid body id, ctl or None).
+
+@contextlib.contextmanager
+def fake_lab(opts, start_pose):
+    from twin.fake_world import FakeMotive, FakeRobot, FakeWorld
+    from twin.live import run_calibration
+    from twin.natnet import NatNetClient
+
+    world = FakeWorld(SimSource(ball=opts.ball), start_pose=start_pose, up_axis="y")
+    motive = FakeMotive(world, command_port=15100).start()
+    client = NatNetClient("127.0.0.1", "127.0.0.1", command_port=15100, data_port=15111, up_axis="y")
+    try:
+        client.start()
+        print(f"connected to {client.server_name}, NatNet {client.version}")
+        robot = FakeRobot(world)
+        print("calibrating body markers...")
+        T, rms, _ = run_calibration(robot, client, world.rb_id, settle_s=0.2, average_s=0.3, verbose=False)
+        err = np.linalg.norm(T[:3, 3] - world.T_rb_body[:3, 3])
+        print(f"calibration rms {rms * 1000:.1f} mm (offset error vs truth {err * 1000:.1f} mm)")
+        yield robot, client, T, world.rb_id, None
+    finally:
+        client.stop()
+        motive.stop()
+
+
+def spot_session(opts):
+    """Authenticated SpotThrows controller (use as a context manager)."""
+    import bosdyn.client.util
+    from bosdyn.client import create_standard_sdk
+
+    import spot_throw_safe as real
+    sdk = create_standard_sdk("SpotThrowTwin")
+    robot = sdk.create_robot(opts.hostname)
+    bosdyn.client.util.authenticate(robot)  # BOSDYN_CLIENT_USERNAME / _PASSWORD, or prompt
+    robot.time_sync.wait_for_sync()
+    assert robot.has_arm(), "This needs a Spot with an arm."
+    return real.SpotThrows(robot, use_software_estop=not opts.external_estop)
+
+
+def mocap_client(opts, up_axis):
+    from twin.natnet import NatNetClient
+    client = NatNetClient(opts.motive_ip, opts.local_ip, multicast=opts.multicast, up_axis=up_axis,
+                          data_port=opts.data_port).start()
+    print(f"OptiTrack: {client.server_name}, NatNet {client.version}")
+    return client
+
+
+@contextlib.contextmanager
+def real_lab(opts):
+    from twin import calibration
+    from twin.live import SpotRobotInterface
+
+    if not opts.hostname or not opts.local_ip:
+        sys.exit("The real lab needs the Spot address (hostname) and --local-ip.")
+    T, rb_id, up_axis, rms = calibration.load(opts.calib)
+    print(f"calibration {opts.calib}: rigid body {rb_id}, residual {rms * 1000:.1f} mm")
+    client = mocap_client(opts, up_axis)
+    try:
+        with spot_session(opts) as ctl:
+            ctl.power_on()
+            ctl.stand()
+            yield SpotRobotInterface(ctl, max_vel=opts.max_vel, max_acc=opts.max_acc), client, T, rb_id, ctl
+    finally:
+        client.stop()
+
+
+def prepare_real_throw(ctl, traj, duration, label):
+    """Operator steps before every real throw."""
+    ctl.stow_arm()
+    ctl.open_gripper()
+    input(f"{label} Put the ball in the gripper, then press Enter to grip...")
+    ctl.close_gripper()
+    time.sleep(1.0)
+    ctl.initial_move(traj[1][0])
+    input(f"Ready to throw (T = {duration:.2f} s). CLEAR THE AREA, then press Enter (Ctrl+C aborts safely)...")
+
+
+def with_optional_view(opts, robot, client, T, rb_id, target, work):
+    """Run work(view_or_None) with or without the real-time window."""
+    if not opts.live_view:
+        return work(None)
+    from twin.live_view import LiveView
+    LiveView(robot, client, T, rb_id, target=target).run(work)
+
+
+# ---- offline commands ------------------------------------------------------
+
+def cmd_simulate(opts):
+    src = SimSource(ball=opts.ball, gripper_delay=opts.gripper_delay,
+                    optitrack=FakeOptiTrack(rate_hz=opts.rate, noise_m=opts.noise, dropout=opts.dropout))
+    traj = trajectory_from(opts)  # first: a --plan sets duration / release / target
+    for i in range(opts.n):
+        rec = src.throw(opts.duration, opts.release_fraction, target=opts.target, trajectory=traj)
+        save_record(rec, "sim", opts, i)
+
+
+def cmd_fake_live(opts):
+    """Calibrate + throw against a fake Motive (real UDP/NatNet) and a fake Spot."""
+    from throw_trajectory import cubic_joint_trajectory
+    from twin.live import LiveSource
+
+    traj = trajectory_from(opts) or cubic_joint_trajectory(*FORWARD_THROW, opts.duration)
+    with fake_lab(opts, traj[1][0]) as (robot, client, T, rb_id, _):
+        live = LiveSource(robot, client, T, rb_id, ball=opts.ball, fly_time=1.5)
+
+        def work(view):
+            for i in range(opts.n):
+                rec = live.throw(opts.duration, opts.release_fraction, target=opts.target, trajectory=traj)
+                a = save_record(rec, "fakelive", opts, i)
+                if view is not None:
+                    view.post_result(rec, a, None, live.last_T_world_robot)
+
+        with_optional_view(opts, robot, client, T, rb_id, opts.target, work)
+
+
+def cmd_optimize(opts):
+    from twin import optimizer as O
+    from twin.live import LiveSource
+
+    if opts.resume:
+        opt = O.Optimizer.load(opts.resume)
+        history_path = Path(opts.resume)
+        print(f"resuming {history_path}: {len(opt.history)} throws so far")
+    else:
+        opt = O.Optimizer(target=tuple(opts.target), space=O.ThrowSpace(max_vel=opts.max_vel, max_acc=opts.max_acc))
+        history_path = DATA_DIR / f"opt_{opts.source}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    DATA_DIR.mkdir(exist_ok=True)
+    stop_at = opts.stop_at / 100.0
+
+    def finish():
+        best = opt.best()
+        if best:
+            print(f"\nBEST: miss {best['miss'] * 100:.1f} cm, "
+                  + ", ".join(f"{k}={v:.3f}" for k, v in best["params"].items()))
+        plot = O.save_plot(opt, history_path.with_suffix(".png"))
+        print(f"history: {history_path}" + (f"\nplot:    {plot}" if plot else ""))
+
+    if opts.source == "sim":
+        src = SimSource(ball=opts.ball, optitrack=FakeOptiTrack())
+
+        def thrower(duration, rf, traj, target):
+            return src.throw(duration, rf, target=target, trajectory=traj)
+
+        O.run(opt, thrower, opts.n, history_path, DATA_DIR, "opt_sim", stop_at=stop_at)
+        return finish()
+
+    lab = fake_lab(opts, opt.space.to_throw(np.mean(opt.space.bounds(), axis=0))[2][1][0]) \
+        if opts.source == "fake-live" else real_lab(opts)
+    with lab as (robot, client, T, rb_id, ctl):
+        live = LiveSource(robot, client, T, rb_id, ball=opts.ball, fly_time=1.5)
+
+        def work(view):
+            def thrower(duration, rf, traj, target):
+                if ctl is not None:
+                    prepare_real_throw(ctl, traj, duration, f"[round {len(opt.history) + 1}]")
+                return live.throw(duration, rf, target=target, trajectory=traj)
+
+            def on_result(rec, a, entry):
+                if view is not None:
+                    view.post_result(rec, a, entry, live.last_T_world_robot)
+
+            O.run(opt, thrower, opts.n, history_path, DATA_DIR, f"opt_{opts.source}", on_result=on_result,
+                  stop_at=stop_at)
+
+        with_optional_view(opts, robot, client, T, rb_id, opt.target, work)
+    finish()
+
+
+def cmd_plan(opts):
+    from twin.click_planner import ClickPlanner, open_window
+    from twin.optimizer import ThrowSpace
+    from twin.planner import ThrowPlanner
+
+    cid = open_window()  # must be PyBullet's first connection, see open_window()
+    print("preparing the planner (standing pose, reachable area)...")
+    space = ThrowSpace(lower=(0.9, 0.3, -1.6, -0.9), upper=(2.0, 0.8, -0.6, 0.9),
+                       max_vel=opts.max_vel, max_acc=opts.max_acc)
+    planner = ThrowPlanner(space=space, gripper_delay=opts.gripper_delay, ball=opts.ball)
+    (rmin, rmax), _ = planner.reach()
+    print(f"reachable: {rmin:.2f}..{rmax:.2f} m from the shoulder axis. Left-click a target in the window.")
+    try:
+        ClickPlanner(planner, cid=cid).run()
+    finally:
+        planner.close()
+
+
+def cmd_analyze(opts):
+    for f in expand(opts.files):
+        print(f)
+        print_analysis(ThrowRecord.load(f))
+
+
+def cmd_view(opts):
+    files = expand(opts.files)
+    if not files:
+        print("No records found. Make one first: python run_twin.py simulate")
+        return
+    Viewer(files).run()
+
+
+def expand(patterns):
+    if not patterns:
+        return sorted(glob.glob(str(DATA_DIR / "*.npz")))
+    return sorted(f for pat in patterns for f in glob.glob(pat))
+
+
+# ---- lab commands ----------------------------------------------------------
+
+def cmd_setup_fixed(opts):
+    """No robot commands: Spot stays where it is. Reads the body rigid body
+    and a ball placed on Spot's forward centre line, saves the calibration."""
+    from twin import calibration
+    from twin.live import _rb_pose, _stable_points
+
+    if not opts.local_ip:
+        sys.exit("setup-fixed needs --local-ip (this PC's IP on the SpotRoom network).")
+    client = mocap_client(opts, opts.up_axis)
+    try:
+        input("Place the ball about 1 m straight in front of Spot, on its centre line, "
+              "high enough for the cameras (0.5-0.8 m, e.g. on a box). Press Enter...")
+        t0 = time.time()
+        time.sleep(1.0)
+        frames = client.frames_between(t0, time.time())
+        T_world_rb = _rb_pose(frames, opts.body_rb)
+        if T_world_rb is None:
+            ids = sorted({k for f in frames for k in f.rigid_bodies})
+            sys.exit(f"Rigid body {opts.body_rb} not tracked (seen: {ids}). Check Motive.")
+        origin = T_world_rb[:3, 3]
+        pts = _stable_points([f.unlabeled() for f in frames])
+        far = [p for p in pts if np.linalg.norm(p[:2] - origin[:2]) > 0.4]
+        print(f"body rigid body at {np.round(origin, 3)}; unlabeled points: "
+              f"{[np.round(p, 3).tolist() for p in pts]}")
+        if len(far) != 1:
+            sys.exit(f"Expected exactly one point more than 0.4 m from the body (the ball), found {len(far)}.")
+        ball = far[0]
+        T = calibration.fixed_body_from_heading_point(T_world_rb, ball)
+        calibration.save(opts.out, T, opts.body_rb, opts.up_axis, 0.0)
+        yaw = np.degrees(np.arctan2(*(ball[:2] - origin[:2])[::-1]))
+        print(f"ball at {np.round(ball, 3)}, {np.linalg.norm(ball[:2] - origin[:2]):.2f} m away; "
+              f"Spot heading {yaw:.1f} deg in Motive")
+        print(f"saved {opts.out}. Don't move Spot; redo this if it moves.")
+    finally:
+        client.stop()
+
+
+def cmd_calibrate(opts):
+    from twin import calibration
+    from twin.live import SpotRobotInterface, run_calibration
+
+    client = mocap_client(opts, opts.up_axis)
+    try:
+        time.sleep(1.0)  # one frame right after connecting can be empty
+        recent = client.frames_between(time.time() - 1.0, time.time())
+        if not any(opts.body_rb in f.rigid_bodies for f in recent):
+            ids = sorted({k for f in recent for k in f.rigid_bodies})
+            sys.exit(f"Rigid body {opts.body_rb} not streamed (seen: {ids}). Check Motive.")
+        with spot_session(opts) as ctl:
+            ctl.power_on()
+            ctl.stand()
+            ctl.open_gripper()
+            input("Put the ball in the gripper, then press Enter to close it...")
+            ctl.close_gripper()
+            time.sleep(1.0)
+            input(f"The arm will move SLOWLY through {len(calibration.CALIBRATION_POSES)} poses. "
+                  f"Clear the area, then press Enter (Ctrl+C aborts)...")
+            debug = Path(opts.out).with_suffix(".debug.npz")
+            print(f"raw calibration data is saved to {debug} after every pose")
+            T, rms, data = run_calibration(SpotRobotInterface(ctl), client, opts.body_rb, save_path=debug)
+            ctl.stow_arm()
+        calibration.save(opts.out, T, opts.body_rb, opts.up_axis, rms)
+        print(f"saved {opts.out}: residual {rms * 1000:.1f} mm "
+              f"({'good' if rms < 0.005 else 'CHECK: should be a few mm'})")
+    finally:
+        client.stop()
+
+
+def cmd_live(opts):
+    from twin.live import LiveSource
+
+    traj = trajectory_from(opts)
+    if traj is None:
+        import spot_throw_safe as real
+        traj = real.sample_trajectory(opts.duration)
+    with real_lab(opts) as (robot, client, T, rb_id, ctl):
+        live = LiveSource(robot, client, T, rb_id, ball=opts.ball)
+        live.raw_path = DATA_DIR / "last_live_raw.npz"
+
+        def work(view):
+            for i in range(opts.n):
+                prepare_real_throw(ctl, traj, opts.duration, f"[{i + 1}/{opts.n}]")
+                rec = live.throw(opts.duration, opts.release_fraction, target=opts.target, trajectory=traj)
+                a = save_record(rec, "live", opts, i)
+                if view is not None:
+                    view.post_result(rec, a, None, live.last_T_world_robot)
+
+        with_optional_view(opts, robot, client, T, rb_id, opts.target, work)
+
+
+# ---- CLI -------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def throw_args(p, default_duration=1.0):
+        p.add_argument("--duration", type=float, default=default_duration, help="swing duration (s)")
+        p.add_argument("--release-fraction", type=float, default=0.5)
+        p.add_argument("--start-pose", type=float, nargs=6, help="custom trajectory: start joints sh0..wr1")
+        p.add_argument("--end-pose", type=float, nargs=6, help="custom trajectory: end joints sh0..wr1")
+        p.add_argument("--target", type=float, nargs=2, metavar=("X", "Y"),
+                       help="target on the floor, robot frame (m)")
+        p.add_argument("--ball", default="tennis")
+        p.add_argument("--n", type=int, default=1, help="number of throws")
+        p.add_argument("--plan", help="use a plan exported by 'run_twin.py plan' (twin_data/plans/*.json)")
+
+    def lab_args(p, hostname_positional=True):
+        if hostname_positional:
+            p.add_argument("hostname", help="Spot IP (SpotRoom: 10.0.0.30)")
+        else:
+            p.add_argument("--hostname", help="Spot IP (SpotRoom: 10.0.0.30), for --source live")
+        p.add_argument("--motive-ip", default="10.0.0.112")
+        p.add_argument("--local-ip", required=hostname_positional,
+                       help="this PC's IP on the SpotRoom network (ipconfig)")
+        p.add_argument("--multicast", action="store_true", help="Motive set to multicast (lab uses unicast)")
+        p.add_argument("--data-port", type=int, default=1511, help="Motive streaming Data Port")
+        p.add_argument("--external-estop", action="store_true", help="tablet / hardware e-stop is the authority")
+        p.add_argument("--calib", default=str(CALIB_FILE))
+        p.add_argument("--max-vel", type=float, default=2.5, help="joint velocity limit (rad/s), lab example: 2.5")
+        p.add_argument("--max-acc", type=float, default=10.0, help="joint acceleration limit (rad/s^2)")
+
+    view_help = "real-time 3D window while throwing"
+
+    s = sub.add_parser("simulate", help="simulate throws and save records")
+    throw_args(s)
+    s.add_argument("--gripper-delay", type=float, default=0.1)
+    s.add_argument("--rate", type=float, default=120.0, help="fake OptiTrack rate (Hz)")
+    s.add_argument("--noise", type=float, default=0.001, help="fake OptiTrack noise std (m)")
+    s.add_argument("--dropout", type=float, default=0.02, help="fraction of lost OptiTrack frames")
+    s.set_defaults(func=cmd_simulate)
+
+    f = sub.add_parser("fake-live", help="run the live pipeline against a fake Motive + fake Spot")
+    throw_args(f)
+    f.add_argument("--live-view", action="store_true", help=view_help)
+    f.set_defaults(func=cmd_fake_live)
+
+    o = sub.add_parser("optimize", help="Bayesian optimization of the throw to hit --target")
+    o.add_argument("--source", choices=["sim", "fake-live", "live"], default="sim")
+    o.add_argument("--target", type=float, nargs=2, metavar=("X", "Y"), default=(0.95, 0.0),
+                   help="target on the floor, robot frame (m)")
+    o.add_argument("--n", type=int, default=20, help="max number of throws")
+    o.add_argument("--stop-at", type=float, default=2.0, help="stop when the miss is below this (cm)")
+    o.add_argument("--resume", help="continue a saved history (twin_data/opt_*.json)")
+    o.add_argument("--ball", default="tennis")
+    o.add_argument("--live-view", action="store_true", help=view_help)
+    lab_args(o, hostname_positional=False)
+    o.set_defaults(func=cmd_optimize)
+
+    pl = sub.add_parser("plan", help="click a target on the floor -> throw trajectory and joint angles")
+    pl.add_argument("--max-vel", type=float, default=2.5, help="joint velocity limit (rad/s)")
+    pl.add_argument("--max-acc", type=float, default=10.0, help="joint acceleration limit (rad/s^2)")
+    pl.add_argument("--gripper-delay", type=float, default=0.1, help="open command -> ball free (s)")
+    pl.add_argument("--ball", default="tennis")
+    pl.set_defaults(func=cmd_plan)
+
+    a = sub.add_parser("analyze", help="print the analysis of saved records")
+    a.add_argument("files", nargs="*")
+    a.set_defaults(func=cmd_analyze)
+
+    v = sub.add_parser("view", help="replay records in the PyBullet window")
+    v.add_argument("files", nargs="*", help="default: all records in twin_data/")
+    v.set_defaults(func=cmd_view)
+
+    sf = sub.add_parser("setup-fixed", help="LAB, no robot commands: Spot fixed; heading from a ball in front")
+    lab_args(sf, hostname_positional=False)
+    sf.add_argument("--body-rb", type=int, required=True, help="Motive rigid body id of Spot's body")
+    sf.add_argument("--up-axis", choices=["y", "z"], default="z")
+    sf.add_argument("--out", default=str(CALIB_FILE))
+    sf.set_defaults(func=cmd_setup_fixed)
+
+    c = sub.add_parser("calibrate", help="LAB: calibrate the body markers (ball held in the gripper)")
+    lab_args(c)
+    c.add_argument("--body-rb", type=int, required=True, help="Motive rigid body id of Spot's body")
+    c.add_argument("--up-axis", choices=["y", "z"], default="z", help="Motive streaming up axis")
+    c.add_argument("--out", default=str(CALIB_FILE))
+    c.set_defaults(func=cmd_calibrate)
+
+    lv = sub.add_parser("live", help="LAB: throw with Spot and record with OptiTrack")
+    lab_args(lv)
+    throw_args(lv, default_duration=2.0)
+    lv.add_argument("--live-view", action="store_true", help=view_help)
+    lv.set_defaults(func=cmd_live)
+
+    opts = parser.parse_args()
+    opts.func(opts)
+
+
+if __name__ == "__main__":
+    main()
