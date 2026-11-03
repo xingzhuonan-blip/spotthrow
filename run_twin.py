@@ -11,6 +11,13 @@ Offline (no hardware):
   python run_twin.py analyze twin_data/*.npz                          # print the analysis
   python run_twin.py view                                             # replay records in 3D
 
+Short commands (lab settings in LAB below; the newest plan unless a file is given):
+  python run_twin.py plan                    # click a target, press e to export
+  python run_twin.py fast-plan --target 1.5 0 # or: a fast overhand throw to (x, y)
+  python run_twin.py sim                     # simulate the newest plan + 3D replay
+  python run_twin.py throw                   # throw it on Spot (no OptiTrack needed)
+  python run_twin.py throw --record          # ...and record it with OptiTrack + 3D window
+
 In the lab (PC on the SpotRoom network, Motive streaming unicast, ball =
 single marker, Spot's body = rigid body; see twin/live.py):
   python run_twin.py calibrate 10.0.0.30 --local-ip <this PC> --body-rb <id>
@@ -38,6 +45,9 @@ DATA_DIR = Path(__file__).resolve().parent / "twin_data"
 CALIB_FILE = Path(__file__).resolve().parent / "calibration.json"
 FORWARD_THROW = ([0, -2.2, 3.0, 0, 0, 1.57], [0, -1.2, 1.8, 0, 0, 1.57])  # found in simulation
 
+# Lab settings used by the short commands 'sim' and 'throw' (edit here if the lab changes).
+LAB = {"hostname": "10.0.0.30", "local_ip": "10.0.0.20", "motive_ip": "10.0.0.112", "data_port": 9000}
+
 
 def trajectory_from(opts):
     """--plan file, or custom start/end pose -> cubic joint trajectory;
@@ -46,6 +56,7 @@ def trajectory_from(opts):
         from twin.planner import load_plan
         d, traj = load_plan(opts.plan)
         opts.duration, opts.release_fraction = d["duration"], d["release_fraction"]
+        opts.plan_gripper_delay = d["gripper_delay"]
         if opts.target is None:
             opts.target = d["target"]
         print(f"plan {opts.plan}: T={opts.duration:.2f} s, release {opts.release_fraction:.2f}, "
@@ -60,8 +71,11 @@ def trajectory_from(opts):
 
 
 def save_record(rec, prefix, opts, i):
+    if getattr(opts, "plan_gripper_delay", None) is not None:
+        rec.params["plan_gripper_delay"] = opts.plan_gripper_delay  # viewer: planned flight
     name = f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_T{opts.duration}_rf{opts.release_fraction}_{i}.npz"
     path = rec.save(DATA_DIR / name)
+    opts.last_record = path
     print(f"saved {path}")
     return print_analysis(rec)
 
@@ -250,15 +264,120 @@ def cmd_plan(opts):
 
     cid = open_window()  # must be PyBullet's first connection, see open_window()
     print("preparing the planner (standing pose, reachable area)...")
-    space = ThrowSpace(lower=(0.9, 0.3, -1.6, -0.9), upper=(2.0, 0.8, -0.6, 0.9),
+    # Search the whole joint range (shoulder yaw = aim all around, any swing
+    # end, any timing); only the joint speed/acceleration limits and an
+    # arm-body clearance check (ThrowPlanner.min_clearance) restrict it.
+    from throw_trajectory import JOINT_LIMIT_MARGIN, JOINT_LIMITS
+    jl = JOINT_LIMITS + np.array([JOINT_LIMIT_MARGIN, -JOINT_LIMIT_MARGIN])
+    space = ThrowSpace(lower=(0.4, 0.05, jl[1, 0], jl[0, 0]), upper=(3.0, 0.95, jl[1, 1], jl[0, 1]),
                        max_vel=opts.max_vel, max_acc=opts.max_acc)
     planner = ThrowPlanner(space=space, gripper_delay=opts.gripper_delay, ball=opts.ball)
     (rmin, rmax), _ = planner.reach()
-    print(f"reachable: {rmin:.2f}..{rmax:.2f} m from the shoulder axis. Left-click a target in the window.")
+    print(f"reachable: {rmin:.2f}..{rmax:.2f} m from the shoulder axis, aim all around. "
+          f"Left-click anywhere in the window.")
     try:
-        ClickPlanner(planner, cid=cid).run()
+        ClickPlanner(planner, cid=cid, fast_fallback=opts.fast_fallback).run()
     finally:
         planner.close()
+
+
+def cmd_fast_plan(opts):
+    """Offline: plan a fast throw (windup / coast / brake) to --target and export it."""
+    from twin.fast_throw import FastThrowPlanner, FastThrowSpace, save_fast_plan
+
+    space = FastThrowSpace(max_vel=opts.max_vel, max_acc=opts.max_acc, gripper_delay=opts.gripper_delay)
+    fp = FastThrowPlanner(space, ball=opts.ball)
+    try:
+        print(f"planning a throw to {opts.target} (joint limit {opts.max_vel} rad/s, "
+              f"release at least {opts.min_speed} m/s)...")
+        plan = fp.plan(opts.target, min_release_speed=opts.min_speed, verbose=True)
+    finally:
+        fp.close()
+    if plan is None:
+        sys.exit("No throw found within the limits (try a closer target or a higher --max-vel).")
+    path = DATA_DIR / "plans" / time.strftime("fastplan_%Y%m%d_%H%M%S.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_fast_plan(plan, space, path)
+    print(f"  swing {plan['duration']:.2f} s, release {plan['release_speed']:.2f} m/s at "
+          f"{plan['elevation_deg']:.0f} deg from {plan['release_height']:.2f} m, "
+          f"peak joint speed {plan['peak_joint_speed']:.2f} rad/s, arm-body clearance "
+          f"{plan['clearance'] * 100:.0f} cm")
+    print(f"  physics lands {np.round(plan['sim_landing'], 3)} (target {np.round(plan['target'], 3)})")
+    print(f"exported {path}\n  simulate:  ./spot sim\n  on Spot:   ./spot throw   (both use the newest plan)")
+
+
+def latest_plan():
+    files = glob.glob(str(DATA_DIR / "plans" / "*.json"))
+    if not files:
+        sys.exit("No plan yet. Make one first: python run_twin.py plan  (or fast-plan --target X Y)")
+    return max(files, key=lambda f: Path(f).stat().st_mtime)
+
+
+def plan_max_vel(path):
+    """Joint speed limit the plan was made for (fast plans store it), else the lab default."""
+    import json
+    return float(json.loads(Path(path).read_text()).get("space", {}).get("max_vel", 2.5))
+
+
+def cmd_sim(opts):
+    """Short: simulate a plan (default: the newest) and open the 3D replay."""
+    opts.plan = opts.plan or latest_plan()
+    opts.n, opts.target, opts.start_pose, opts.end_pose = 1, None, None, None
+    opts.ball, opts.rate, opts.noise, opts.dropout = "tennis", 120.0, 0.001, 0.02
+    from twin.planner import load_plan
+    opts.gripper_delay = load_plan(opts.plan)[0]["gripper_delay"]  # simulate the delay the plan assumed
+    cmd_simulate(opts)
+    if not opts.no_view:
+        Viewer([str(opts.last_record)]).run()
+
+
+def motive_answers(opts, timeout=3.0):
+    from twin.natnet import NatNetClient
+    try:
+        NatNetClient(opts.motive_ip, opts.local_ip, data_port=opts.data_port).start(timeout=timeout).stop()
+        return True
+    except (TimeoutError, OSError):
+        return False
+
+
+def cmd_throw(opts):
+    """Short: throw a plan (default: the newest) on Spot with the lab settings.
+    OptiTrack is not needed. With --record it records the throw with
+    OptiTrack and shows the live 3D window (Motive must be streaming)."""
+    opts.plan = opts.plan or latest_plan()
+    for k, v in LAB.items():
+        setattr(opts, k, v)
+    opts.multicast, opts.external_estop, opts.calib = False, True, str(CALIB_FILE)
+    opts.max_vel = plan_max_vel(opts.plan) if opts.max_vel is None else opts.max_vel
+    opts.max_acc, opts.n, opts.ball = 10.0, 1, "tennis"
+    opts.target, opts.start_pose, opts.end_pose = None, None, None
+    opts.duration, opts.release_fraction = 1.0, 0.5  # replaced by the plan
+    print(f"Spot {opts.hostname}, joint limit {opts.max_vel} rad/s, e-stop: tablet / hardware")
+    if opts.dry_run:
+        from throw_trajectory import check_trajectory
+        traj = trajectory_from(opts)
+        problems = check_trajectory(*traj, opts.max_vel, opts.max_acc)
+        print(f"start pose {np.round(traj[1][0], 3).tolist()}, peak joint speed "
+              f"{np.abs(traj[2]).max():.2f} rad/s, limits: {'OK' if not problems else problems}")
+        if opts.record:
+            print(f"OptiTrack (--record): {'answers' if motive_answers(opts) else 'NOT answering -> the throw would stop'}")
+        else:
+            print("OptiTrack: not used (add --record to record the throw)")
+        print("dry run: nothing sent to Spot.")
+        return
+    if opts.record:
+        opts.live_view = not opts.no_view
+        return cmd_live(opts)
+    print("OptiTrack not used: the throw is not recorded (add --record to record it).")
+    traj = trajectory_from(opts)
+    with spot_session(opts) as ctl:
+        ctl.power_on()
+        ctl.stand()
+        prepare_real_throw(ctl, traj, opts.duration, "[1/1]")
+        ctl.throw(T=opts.duration, max_vel=opts.max_vel, max_acc=opts.max_acc, release=True,
+                  release_fraction=opts.release_fraction, trajectory=traj)
+        time.sleep(1.0)
+        ctl.stow_arm()
 
 
 def cmd_analyze(opts):
@@ -437,7 +556,19 @@ def main():
     pl.add_argument("--max-acc", type=float, default=10.0, help="joint acceleration limit (rad/s^2)")
     pl.add_argument("--gripper-delay", type=float, default=0.1, help="open command -> ball free (s)")
     pl.add_argument("--ball", default="tennis")
+    pl.add_argument("--no-fast-fallback", dest="fast_fallback", action="store_false",
+                    help="don't plan a fast throw when the gentle throw can't reach a click")
     pl.set_defaults(func=cmd_plan)
+
+    fp = sub.add_parser("fast-plan", help="offline: plan a fast throw (windup/coast/brake) to a target")
+    fp.add_argument("--target", type=float, nargs=2, required=True, metavar=("X", "Y"),
+                    help="target on the floor, robot frame (m)")
+    fp.add_argument("--max-vel", type=float, default=2.5, help="joint speed limit (rad/s)")
+    fp.add_argument("--max-acc", type=float, default=10.0, help="joint acceleration limit (rad/s^2)")
+    fp.add_argument("--min-speed", type=float, default=1.5, help="minimum ball release speed (m/s)")
+    fp.add_argument("--gripper-delay", type=float, default=0.1)
+    fp.add_argument("--ball", default="tennis")
+    fp.set_defaults(func=cmd_fast_plan)
 
     a = sub.add_parser("analyze", help="print the analysis of saved records")
     a.add_argument("files", nargs="*")
@@ -466,6 +597,20 @@ def main():
     throw_args(lv, default_duration=2.0)
     lv.add_argument("--live-view", action="store_true", help=view_help)
     lv.set_defaults(func=cmd_live)
+
+    sm = sub.add_parser("sim", help="short: simulate the newest plan (or PLAN) and replay it in 3D")
+    sm.add_argument("plan", nargs="?", help="plan file (default: newest in twin_data/plans)")
+    sm.add_argument("--no-view", action="store_true", help="no 3D replay window")
+    sm.set_defaults(func=cmd_sim)
+
+    th = sub.add_parser("throw", help="LAB, short: throw the newest plan (or PLAN) on Spot, lab settings built in")
+    th.add_argument("plan", nargs="?", help="plan file (default: newest in twin_data/plans)")
+    th.add_argument("--max-vel", type=float, help="joint speed limit (default: the plan's, else 2.5)")
+    th.add_argument("--record", action="store_true",
+                    help="record with OptiTrack + live 3D window (Motive must be streaming)")
+    th.add_argument("--no-view", action="store_true", help="with --record: no real-time 3D window")
+    th.add_argument("--dry-run", action="store_true", help="show what would run; nothing is sent to Spot")
+    th.set_defaults(func=cmd_throw)
 
     opts = parser.parse_args()
     opts.func(opts)

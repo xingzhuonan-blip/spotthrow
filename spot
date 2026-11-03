@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Short launcher: ./spot plan | ./spot sim | ./spot throw   (any run_twin.py command works)
+cd "$(dirname "$0")" && exec conda run -n spotthrow --no-capture-output python run_twin.py "$@"

@@ -251,7 +251,7 @@ def test_click_planner():
 
     # Click -> plan (headless: call click() as the mouse handler would).
     planner = ThrowPlanner()
-    ui = ClickPlanner(planner, gui=False)
+    ui = ClickPlanner(planner, gui=False, fast_fallback=True)
     try:
         ui.click((0.95, 0.2))
         t0 = time.time()
@@ -265,20 +265,83 @@ def test_click_planner():
         assert ui.plan and ui.plan["ok"], ui.status
         err = np.linalg.norm(ui.plan["sim_landing"] - (0.95, 0.2))
         assert err < 0.02, err
-        path = ui.export()
+        import tempfile
+        path = ui.export(tempfile.mkdtemp())
         d, traj = load_plan(path)
         assert np.allclose(traj[1][0], d["start_pose"]) and np.allclose(traj[1][-1], d["end_pose"])
-        ui.click((3.0, 0.0))  # far outside the reach
+        # Beyond the gentle throw: falls back to a fast throw, which exports and reloads.
+        ui.plan = None
+        ui.click((1.5, 0.0))
+        t0 = time.time()
+        while time.time() - t0 < 300 and (ui.busy or ui.pending):
+            ui._consume_pending()
+            ui._animate()
+            time.sleep(0.02)
+        assert ui.plan and ui.plan.get("kind") == "fast", ui.status
+        fast_err = np.linalg.norm(ui.plan["sim_landing"] - (1.5, 0.0))
+        assert fast_err < 0.03, fast_err
+        fpath = ui.export(tempfile.mkdtemp())
+        assert fpath.name.startswith("fastplan_")
+        d, traj = load_plan(fpath)
+        assert np.allclose(traj[1][0], ui.plan["start_pose"])
+        ui.click((3.0, 0.0))  # too far even for the fast throw at 2.5 rad/s
         while ui.busy or ui.pending:
             ui._consume_pending()
             time.sleep(0.02)
-        assert "reach" in ui.status, ui.status
+        assert "No throw reaches" in ui.status, ui.status
     finally:
         p.disconnect(ui.cid)
         planner.close()
     print(f"7. Click planner: mouse ray exact ({worst:.0e} m); click (0.95, 0.2) -> plan, physics lands "
-          f"{err * 100:.1f} cm away; stages {sorted(set(seen))}; export/load OK; far click rejected: OK")
+          f"{err * 100:.1f} cm away; stages {sorted(set(seen))}; export/load OK; 1.5 m -> fast throw "
+          f"{fast_err * 100:.1f} cm away; 3 m click rejected: OK")
     return path
+
+
+def test_fast_throw():
+    """Windup / coast / brake throw: smooth profile, top speed while the
+    gripper opens, plan file round trip, and a physics check of one plan."""
+    import json
+    import tempfile
+    from twin.fast_throw import FastThrowPlanner, FastThrowSpace, save_fast_plan
+    from twin.planner import load_plan
+    from throw_trajectory import check_trajectory
+
+    space = FastThrowSpace(max_vel=2.5)
+    x = [-1.6, 1.4, -0.6, 2.0, -2.5, 1.0, 0.0]
+    T, rf, (t, pos, vel) = space.build(x)
+    assert t[0] == 0 and abs(t[-1] - T) < 1e-9
+    assert np.allclose(vel[0], 0) and np.allclose(vel[-1], 0), "must start and end at rest"
+    dv = np.abs(np.diff(vel, axis=0)).max()
+    assert dv < 0.2, f"velocity jumps by {dv:.2f} rad/s between samples"
+    # position = integral of velocity
+    assert np.allclose(pos[-1] - pos[0], np.sum((vel[1:] + vel[:-1]) / 2 * np.diff(t)[:, None], axis=0), atol=2e-3)
+    t_free = rf * T + space.gripper_delay
+    ta = space.timing(np.array(x[3:6]))
+    tc = space.coast_time()
+    assert abs(t_free - (ta + tc)) < 1e-9, "ball free when braking starts"
+    assert rf * T >= ta + space.open_margin - 1e-9, "open command only after the arm stops accelerating"
+    assert not check_trajectory(t, pos, vel, 2.5, 10.0)
+
+    fp = FastThrowPlanner(space)
+    try:
+        plan = fp.plan([1.5, 0.0], sim_iters=3, n_starts=24)
+        assert plan is not None, "no fast throw to 1.5 m at 2.5 rad/s"
+        assert np.linalg.norm(np.subtract(plan["sim_landing"], [1.5, 0.0])) < 0.03, plan["sim_landing"]
+        assert plan["release_speed"] >= 1.45 and plan["release_height"] >= 1.0, plan
+        assert plan["clearance"] >= space.clearance
+        assert plan["rehit"] <= fp.max_rehit, "the gripper must not come back at the ball"
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "fast.json"
+            save_fast_plan(plan, space, path)
+            dd, traj = load_plan(path)
+            assert json.loads(path.read_text())["kind"] == "fast"
+            assert np.allclose(traj[1], fp.space.build(plan["x"])[2][1])
+    finally:
+        fp.close()
+    print(f"8. Fast throw: smooth windup/coast/brake; 1.5 m plan: release {plan['release_speed']:.2f} m/s "
+          f"at {plan['elevation_deg']:.0f} deg from {plan['release_height']:.2f} m, physics lands "
+          f"{np.round(plan['sim_landing'], 3)}, clearance {plan['clearance'] * 100:.0f} cm: OK")
 
 
 if __name__ == "__main__":
@@ -289,4 +352,5 @@ if __name__ == "__main__":
     test_optimizer()
     test_live_view()
     test_click_planner()
+    test_fast_throw()
     print("All tests passed.")

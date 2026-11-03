@@ -2,10 +2,10 @@
 
   orange dots   measured ball positions (OptiTrack)
   grey line     gripper path (from the arm joints)
-  yellow        estimated release point
-  blue line     flight predicted from the release state alone
-  red / blue X  measured / predicted landing point
+  green line    planned flight (commanded arm motion, ball let go
+                PLAN_GRIPPER_DELAY after the open command), green dot = planned release
   green X       target (if the record has one)
+  red X         measured landing point
 
 Keys (click the 3D view first):
   space  pause / play        left / right  step back / forward (when paused)
@@ -24,6 +24,25 @@ from .record import ThrowRecord
 
 FPS = 60.0
 ORANGE, GREY, YELLOW, BLUE, RED, GREEN = (1, .5, 0), (.5, .5, .5), (1, .9, 0), (.1, .4, 1), (1, .1, .1), (0, .8, 0)
+PLAN_GRIPPER_DELAY = 0.1  # s, the planner's default (run_twin.py plan --gripper-delay)
+
+
+def planned_flight(rec, gripper_delay=PLAN_GRIPPER_DELAY, h=0.005):
+    """Flight the plan expected: gripper state from the COMMANDED joints at
+    open command + gripper_delay, then gravity + drag to the floor."""
+    from .kinematics import ArmFK
+    P = rec.params
+    t0 = rec.release_cmd_t + gripper_delay
+    q_cmd_at = lambda t: np.array([np.interp(t, rec.robot_t, rec.q_cmd[:, j]) for j in range(6)])
+    fk = ArmFK()
+    try:
+        a, b = (fk.grasp_point(q_cmd_at(t), *rec.body_at(t)) for t in (t0 - h, t0 + h))
+    finally:
+        fk.close()
+    p0, v0 = (a + b) / 2, (b - a) / (2 * h)
+    k = ballistics.drag_k(P["ball_radius"], P["ball_mass"], P["drag_coeff"])
+    _, fx = ballistics.simulate_flight(p0, v0, k, ground_z=rec.floor_z + P["ball_radius"])
+    return p0, fx
 
 
 def summary_lines(rec, a):
@@ -109,14 +128,14 @@ class Viewer:
     def draw_static(self):
         rec, a = self.rec, self.a
         ok = ~np.isnan(rec.ball_pos).any(axis=1)
-        p.addUserDebugPoints(rec.ball_pos[ok].tolist(), [ORANGE] * int(ok.sum()), 4, physicsClientId=self.cid)
+        if ok.any():  # pybullet fails on an empty point list (record without ball data)
+            p.addUserDebugPoints(rec.ball_pos[ok].tolist(), [ORANGE] * int(ok.sum()), 4, physicsClientId=self.cid)
         self.polyline(a["grip"][::4], GREY, 1)
-        if a.get("release_t") is not None:
-            p.addUserDebugPoints([a["p0"].tolist()], [YELLOW], 12, physicsClientId=self.cid)
-            self.polyline(a["pred_pos"][::10], BLUE, 2)
-            self.cross(a["pred_landing"], BLUE)
-            if a.get("meas_landing") is not None:
-                self.cross(a["meas_landing"], RED)
+        p0, fx = planned_flight(rec, rec.params.get("plan_gripper_delay", PLAN_GRIPPER_DELAY))
+        p.addUserDebugPoints([p0.tolist()], [GREEN], 12, physicsClientId=self.cid)
+        self.polyline(fx[::10].tolist() + [fx[-1].tolist()], GREEN, 2)
+        if a.get("meas_landing") is not None:
+            self.cross(a["meas_landing"], RED)
         if not np.isnan(rec.target).any():
             self.cross(rec.target, GREEN, 0.1)
         for i, text in enumerate(summary_lines(rec, a)):

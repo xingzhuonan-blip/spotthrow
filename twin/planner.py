@@ -121,6 +121,30 @@ class ThrowPlanner:
 
     # ---- reachable set -------------------------------------------------
 
+    STOW = np.array([0.0, -3.11, 3.13, 0.0, 1.57, 0.0])  # approximate
+
+    def min_clearance(self, x, n=25):
+        """Smallest arm-to-body distance (m) along the swing, start pose
+        included. Needed once the aim can turn the arm over Spot's sides/back.
+        The slow move from stow is not checked here: with the approximate stow
+        pose the simulated wrist grazes the body (-6 cm) on a move Spot has
+        made safely many times."""
+        import pybullet as pb
+        from .kinematics import ARM_JOINTS
+        start, end, P = self._poses(x)
+        T = P["duration"]
+        qs = [cubic_state(start, end, T, t) for t in np.linspace(0, T, n)]
+        best = 1.0
+        for q in qs:
+            for j, qj in zip(ARM_JOINTS, q):
+                pb.resetJointState(self.fk.robot, j, qj, physicsClientId=self.fk.cid)
+            for a in (21, 22, 23, 24, 25):
+                for b in range(2, 18):
+                    for c in pb.getClosestPoints(self.fk.robot, self.fk.robot, 0.1, linkIndexA=a, linkIndexB=b,
+                                                 physicsClientId=self.fk.cid):
+                        best = min(best, c[8])
+        return best
+
     def build_table(self, n=(10, 9, 9)):
         """Landings for sh0 = 0 over a grid of (duration, release, sh1_end)."""
         lo, hi = self.space.bounds()
@@ -231,6 +255,9 @@ class ThrowPlanner:
                 return {"ok": False, "x": None, "reason": "out of reach after correction"}
         else:
             sim_land, _ = self.simulate(x)
+        clear = self.min_clearance(x)
+        if clear < 0.03:
+            return {"ok": False, "x": x, "reason": f"arm would pass {clear * 100:.0f} cm from the body"}
         start, end, p = self._poses(x)
         pr = self.predict(x)
         return {"ok": True, "x": x, "params": p, "start_pose": start, "end_pose": end,
@@ -249,10 +276,19 @@ def save_plan(plan, path):
         "duration": float(p["duration"]), "release_fraction": float(p["release_fraction"]),
         "start_pose": [float(v) for v in plan["start_pose"]], "end_pose": [float(v) for v in plan["end_pose"]],
         "sim_landing": None if plan["sim_landing"] is None else [float(v) for v in plan["sim_landing"]],
+        "gripper_delay": float(plan.get("gripper_delay", 0.1)),
     }, indent=2))
 
 
 def load_plan(path):
     d = json.loads(Path(path).read_text())
+    if d.get("kind") == "fast":  # twin/fast_throw.py: windup / coast / brake profile
+        from .fast_throw import FastThrowSpace
+        space = {"release_at": "mid", **d["space"]}  # plans saved before 2026-11-03: mid-coast release
+        T, rf, traj = FastThrowSpace(**space).build(d["x"])
+        d["duration"], d["release_fraction"] = T, rf
+        d["gripper_delay"] = d["space"].get("gripper_delay", 0.1)
+        return d, traj
+    d.setdefault("gripper_delay", 0.1)  # older plans: the planner default
     traj = cubic_joint_trajectory(d["start_pose"], d["end_pose"], d["duration"])
     return d, traj

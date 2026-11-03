@@ -3,13 +3,15 @@
   python run_twin.py plan
 
 Window (PyBullet):
-  * green outline   floor area the throw can reach (with the current speed limits)
-  * LEFT CLICK      inside it: target. The plan is solved with the fast model
+  * LEFT CLICK      anywhere: target. The plan is solved with the fast model
                     at once, then checked in the physics simulation (and
                     corrected) in the background; the arm then previews the swing.
   * e               export the plan (JSON) for:  run_twin.py live --plan <file>
   * q               quit
-Camera: Ctrl + left drag rotates, Ctrl + middle drag pans, wheel zooms.
+Camera: RIGHT drag rotates, MIDDLE (wheel button) drag pans, wheel zooms.
+Floor: grid every 0.5 m around Spot, blue rings
+every 0.5 m labelled with the distance; the cursor's floor position and
+distance are shown live at the top.
 """
 
 import threading
@@ -62,8 +64,9 @@ def open_window():
 
 
 class ClickPlanner:
-    def __init__(self, planner, gui=True, cid=None):
+    def __init__(self, planner, gui=True, cid=None, fast_fallback=False):
         self.pl = planner
+        self.fast_fallback = fast_fallback  # try a fast throw when the gentle one can't
         self.gui = gui
         self.cid = cid if cid is not None else p.connect(p.GUI if gui else p.DIRECT)
         p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=self.cid)
@@ -79,12 +82,16 @@ class ClickPlanner:
         self._set_arm(planner.space.start_pose)
         p.resetDebugVisualizerCamera(2.6, -90, -55, (0.75, 0, planner.floor_z), physicsClientId=self.cid)
         self.plan = None           # latest finished plan
+        self.fast = None           # FastThrowPlanner, made on the first far click
         self.preview = None        # (start, end, T, t_release, p0, v0) being animated
         self.busy = False
-        self.status = "Left-click inside the green area to choose a target."
+        self.status = "Left-click a target on the floor."
         self.plan_items = []
         self.text_items = []
-        self._draw_reach()
+        self.drag = None           # (button, x, y) while the right / middle button is held
+        self.cursor_item = -1
+        self._last_cursor = 0.0
+        self._draw_floor_grid()
         self._draw_text()
 
     # ---- drawing -------------------------------------------------------
@@ -107,6 +114,63 @@ class ClickPlanner:
         x, y, z = pos
         self._line((x - size, y, z), (x + size, y, z), color, 4, store)
         self._line((x, y - size, z), (x, y + size, z), color, 4, store)
+
+    def _draw_floor_grid(self, step=0.5, x_range=(-1.0, 3.0), y_range=(-2.0, 2.0), rings=(0.5, 1.0, 1.5, 2.0, 2.5, 3.0)):
+        """Distance aids in the robot frame (origin = Spot's body centre on the floor)."""
+        z = self.pl.floor_z + 0.001
+        light = (.75, .75, .75)
+        for x in np.arange(x_range[0], x_range[1] + 1e-9, step):
+            self._line((x, y_range[0], z), (x, y_range[1], z), light, 1)
+        for y in np.arange(y_range[0], y_range[1] + 1e-9, step):
+            self._line((x_range[0], y, z), (x_range[1], y, z), light, 1)
+        for r in rings:
+            f = np.linspace(-np.pi / 2, np.pi / 2, 61)  # front half: where throws go
+            pts = [(r * np.cos(a), r * np.sin(a), z) for a in f]
+            for a, b in zip(pts[:-1], pts[1:]):
+                self._line(a, b, (.45, .55, .9), 1)
+            p.addUserDebugText(f"{r:g} m", (r * 0.707 + 0.03, -r * 0.707, z), (.2, .3, .8), 1.0,
+                               physicsClientId=self.cid)
+
+    def _show_cursor(self, mx, my):
+        now = time.time()
+        if now - self._last_cursor < 0.08:
+            return
+        self._last_cursor = now
+        w, h, view, proj = p.getDebugVisualizerCamera(physicsClientId=self.cid)[:4]
+        if w == 0 or h == 0:
+            return
+        hit = floor_hit(*mouse_ray(w, h, view, proj, mx, my), self.pl.floor_z)
+        if hit is None:
+            return
+        text = f"cursor: x {hit[0]:+.2f}  y {hit[1]:+.2f} m   distance {np.hypot(hit[0], hit[1]):.2f} m"
+        self.cursor_item = p.addUserDebugText(text, (0.2, 1.3, 1.05), (0, 0, .8), 1.3,
+                                              replaceItemUniqueId=self.cursor_item, physicsClientId=self.cid)
+
+    def _camera_mouse(self, etype, mx, my, button, state):
+        """Right drag = rotate, middle drag = pan (no Ctrl needed)."""
+        if etype == 2 and button in (1, 2):
+            if state & p.KEY_WAS_TRIGGERED:
+                self.drag = (button, mx, my)
+            elif state & p.KEY_WAS_RELEASED:
+                self.drag = None
+            return
+        if etype != 1 or self.drag is None:
+            return
+        b, x0, y0 = self.drag
+        dx, dy = mx - x0, my - y0
+        self.drag = (b, mx, my)
+        cam = p.getDebugVisualizerCamera(physicsClientId=self.cid)
+        horiz, vert, yaw, pitch, dist, target = (np.array(cam[6]), np.array(cam[7]), cam[8], cam[9],
+                                                 cam[10], np.array(cam[11]))
+        if b == 2:
+            yaw -= 0.3 * dx
+            pitch = float(np.clip(pitch - 0.3 * dy, -89.0, -2.0))
+        else:
+            k = dist * 0.0015
+            hn = horiz / max(np.linalg.norm(horiz), 1e-9)
+            vn = vert / max(np.linalg.norm(vert), 1e-9)
+            target = target - hn * dx * k + vn * dy * k
+        p.resetDebugVisualizerCamera(dist, yaw, pitch, target.tolist(), physicsClientId=self.cid)
 
     def _draw_reach(self):
         (rmin, rmax), (a0, a1) = self.pl.reach()
@@ -140,7 +204,8 @@ class ClickPlanner:
                 f"(+{self.pl.gripper_delay * 1000:.0f} ms delay)",
                 f"start joints [deg] sh0 sh1 el0 el1 wr0 wr1: {deg(pl['start_pose'])}",
                 f"end   joints [deg] sh0 sh1 el0 el1 wr0 wr1: {deg(pl['end_pose'])}",
-                f"peak joint speed {self.pl.peak_speed(pl['x']):.2f} rad/s (limit {self.pl.space.max_vel})",
+                f"{'FAST throw (windup/coast/brake)' if pl.get('kind') == 'fast' else 'gentle throw'}, "
+                f"peak joint speed {pl['peak']:.2f} rad/s (limit {self.pl.space.max_vel})",
                 f"release speed {np.linalg.norm(v0):.2f} m/s, elevation "
                 f"{np.degrees(np.arctan2(v0[2], np.linalg.norm(v0[:2]))):.0f} deg",
             ]
@@ -166,16 +231,17 @@ class ClickPlanner:
         for a, b in zip(path[:-1], path[1:]):
             self._line(a, b, BLUE, 2, self.plan_items)
         # Gripper path over the swing.
-        start, end, T = plan["start_pose"], plan["end_pose"], plan["params"]["duration"]
+        T, q_at = plan["T"], plan["q_at"]
         pts = []
         for s in np.linspace(0, T, 25):
-            self._set_arm(cubic_state(start, end, T, s))
+            self._set_arm(q_at(s))
             pts.append(self._grip())
         for a, b in zip(pts[:-1], pts[1:]):
             self._line(a, b, GREY, 2, self.plan_items)
         if physics_done and plan.get("sim_landing") is not None:
             self._cross((*plan["sim_landing"], tz), RED, 0.05, self.plan_items)
-        self.preview = (start, end, T, rel["t_release"], rel["p0"], rel["v0"], plan["residual"])
+        self.preview = (q_at, T, plan["t_release"], rel["p0"], rel["v0"], plan["residual"],
+                        rel.get("t_flight", 1.0))
         self.preview_t0 = time.time()
 
     # ---- planning (background thread) ---------------------------------
@@ -185,6 +251,7 @@ class ClickPlanner:
             return
         self.busy = True
         self.status = f"Planning for ({target_xy[0]:.2f}, {target_xy[1]:.2f})..."
+        print(f"click at ({target_xy[0]:.2f}, {target_xy[1]:.2f}) m (robot frame: x forward, y left)", flush=True)
         self._draw_text()
         threading.Thread(target=self._plan_worker, args=(np.array(target_xy),), daemon=True).start()
 
@@ -192,13 +259,23 @@ class ClickPlanner:
         try:
             self.pl.residual = np.zeros(2)
             x, land, miss = self.pl.solve(target)
+            why = None
             if x is None or miss > 0.05:
-                self.pending = ("fail", "Out of reach: click inside the green area.")
-                return
-            quick = self._as_plan(x, target)
-            self.pending = ("quick", quick)
-            full = self.pl.plan(target)
-            self.pending = ("full", full) if full["ok"] else ("fail", full["reason"])
+                why = "out of reach"
+            elif self.pl.min_clearance(x) < 0.03:
+                why = "arm too close to the body"
+            if why is None:
+                quick = self._as_plan(x, target)
+                self.pending = ("quick", quick)
+                full = self.pl.plan(target)
+                if full["ok"]:
+                    self.pending = ("full", self._with_motion(full))
+                    return
+                why = full["reason"]
+            if self.fast_fallback:
+                self._fast_fallback(target, why)
+            else:
+                self.pending = ("fail", f"No gentle throw: {why}.")
         except Exception as err:  # keep the window alive
             self.pending = ("fail", f"error: {err}")
         finally:
@@ -206,11 +283,45 @@ class ClickPlanner:
 
     pending = None
 
+    def _fast_fallback(self, target, why):
+        """The gentle throw can't do it: plan a fast throw (twin/fast_throw.py)."""
+        from .fast_throw import FastThrowPlanner, FastThrowSpace
+        self.status = f"Gentle throw: {why}. Planning a FAST throw (~30 s)..."
+        self.pending = ("status", self.status)
+        if self.fast is None:
+            space = FastThrowSpace(max_vel=self.pl.space.max_vel, max_acc=self.pl.space.max_acc,
+                                   gripper_delay=self.pl.gripper_delay)
+            self.fast = FastThrowPlanner(space, base=self.pl)
+        fp = self.fast
+        plan = fp.plan(target)
+        if plan is None:
+            self.pending = ("fail", f"No throw reaches ({target[0]:.2f}, {target[1]:.2f}) "
+                                    f"at {fp.space.max_vel} rad/s (gentle: {why}; fast: none found).")
+            return
+        T, rf, (times, pos, vel) = fp.space.build(plan["x"])
+        pr = fp.predict(plan["x"])
+        land = np.asarray(pr["landing"]) if pr["landing"] is not None else np.asarray(plan["sim_landing"])
+        self.pending = ("full", {
+            "ok": True, "kind": "fast", "fast_plan": plan, "x": np.asarray(plan["x"]), "target": target,
+            "T": T, "t_release": rf * T + fp.space.gripper_delay,
+            "q_at": lambda t: np.array([np.interp(t, times, pos[:, j]) for j in range(6)]),
+            "start_pose": pos[0], "end_pose": pos[-1],
+            "release": {**pr, "t_release": rf * T + fp.space.gripper_delay},
+            "residual": np.asarray(plan["sim_landing"]) - land,
+            "sim_landing": np.asarray(plan["sim_landing"]),
+            "params": {"duration": T, "release_fraction": rf}, "peak": plan["peak_joint_speed"]})
+
+    def _with_motion(self, plan):
+        """Gentle plans: add the same motion fields the fast plans carry."""
+        start, end, T = plan["start_pose"], plan["end_pose"], plan["params"]["duration"]
+        return {**plan, "kind": "gentle", "T": T, "t_release": plan["release"]["t_release"],
+                "q_at": lambda t: cubic_state(start, end, T, t), "peak": self.pl.peak_speed(plan["x"])}
+
     def _as_plan(self, x, target):
         start, end, P = self.pl._poses(x)
-        return {"ok": True, "x": x, "params": P, "start_pose": start, "end_pose": end,
-                "release": self.pl.predict(x), "residual": self.pl.residual.copy(), "target": target,
-                "sim_landing": None}
+        return self._with_motion({"ok": True, "x": x, "params": P, "start_pose": start, "end_pose": end,
+                                  "release": self.pl.predict(x), "residual": self.pl.residual.copy(),
+                                  "target": target, "sim_landing": None})
 
     def _consume_pending(self):
         if self.pending is None:
@@ -218,6 +329,9 @@ class ClickPlanner:
         kind, data = self.pending
         self.pending = None
         if kind == "fail":
+            self.status = data
+            print(f"  -> {data}", flush=True)
+        elif kind == "status":
             self.status = data
         elif kind == "quick":
             self.plan = data
@@ -234,35 +348,45 @@ class ClickPlanner:
     def _animate(self):
         if self.preview is None:
             return
-        start, end, T, t_rel, p0, v0, residual = self.preview
+        q_at, T, t_rel, p0, v0, residual, t_flight = self.preview
         slow = 0.5
         t = ((time.time() - self.preview_t0) * slow) % (T + 1.5)
-        self._set_arm(cubic_state(start, end, T, t))
+        self._set_arm(q_at(min(t, T)))
         if t < t_rel:
             ball = self._grip()
         else:
             s = t - t_rel
             ball = p0 + v0 * s + np.array([0, 0, -4.905 * s * s])
-            ball[:2] += residual * min(1.0, s / max(self.plan["release"].get("t_flight", 1.0), 1e-3))
+            ball[:2] += residual * min(1.0, s / max(t_flight, 1e-3))
             ball[2] = max(ball[2], self.pl.floor_z + self.pl.radius)
         p.resetBasePositionAndOrientation(self.ball, ball, (0, 0, 0, 1), physicsClientId=self.cid)
 
-    def export(self):
+    def export(self, plan_dir=None):
+        """plan_dir: where to save (default twin_data/plans; tests pass a temp dir
+        so 'run_twin.py throw' never picks a test plan as the newest)."""
         if self.plan is None or not self.plan.get("ok"):
             self.status = "Nothing to export yet."
             return None
-        PLAN_DIR.mkdir(parents=True, exist_ok=True)
-        path = PLAN_DIR / f"plan_{time.strftime('%Y%m%d_%H%M%S')}.json"
-        save_plan(self.plan, path)
+        plan_dir = PLAN_DIR if plan_dir is None else Path(plan_dir)
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        if self.plan.get("kind") == "fast":
+            from .fast_throw import save_fast_plan
+            path = plan_dir / f"fastplan_{time.strftime('%Y%m%d_%H%M%S')}.json"
+            save_fast_plan(self.plan["fast_plan"], self.fast.space, path)
+        else:
+            path = plan_dir / f"plan_{time.strftime('%Y%m%d_%H%M%S')}.json"
+            save_plan({**self.plan, "gripper_delay": self.pl.gripper_delay}, path)
         self.status = f"Exported {path.name}"
-        print(f"exported {path}\n  simulate:  python run_twin.py simulate --plan {path}\n"
-              f"  on Spot:   python run_twin.py live 10.0.0.30 --local-ip <this PC> --plan {path} --live-view")
+        print(f"exported {path}\n  on Spot:   python run_twin.py throw --record   (uses the newest plan)")
         return path
 
     def run(self):
         while p.isConnected(self.cid):
             for ev in p.getMouseEvents(physicsClientId=self.cid):
                 etype, mx, my, button, state = ev
+                self._camera_mouse(etype, mx, my, button, state)
+                if etype == 1 and self.drag is None:
+                    self._show_cursor(mx, my)
                 if etype == 2 and button == 0 and state & p.KEY_WAS_RELEASED:
                     w, h, view, proj = p.getDebugVisualizerCamera(physicsClientId=self.cid)[:4]
                     if w == 0 or h == 0:

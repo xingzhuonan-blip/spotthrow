@@ -53,8 +53,8 @@
     -0.239587506046363
    ],
    "miss": 0.3979220853687664,
-   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round001_20261022_160403.npz",
-   "time": "2026-10-22 16:04:04"
+   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round001_20261103_172010.npz",
+   "time": "2026-11-03 17:20:11"
   },
   {
    "x": [
@@ -74,8 +74,8 @@
     -0.2891556768412654
    ],
    "miss": 0.44243941509183576,
-   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round002_20261022_160404.npz",
-   "time": "2026-10-22 16:04:04"
+   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round002_20261103_172011.npz",
+   "time": "2026-11-03 17:20:11"
   },
   {
    "x": [
@@ -95,8 +95,8 @@
     -0.24094658349359627
    ],
    "miss": 0.39112136900236155,
-   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round003_20261022_160404.npz",
-   "time": "2026-10-22 16:04:05"
+   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round003_20261103_172011.npz",
+   "time": "2026-11-03 17:20:12"
   },
   {
    "x": [
@@ -116,8 +116,8 @@
     0.1061017025914332
    ],
    "miss": 0.05401733013045032,
-   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round004_20261022_160405.npz",
-   "time": "2026-10-22 16:04:05"
+   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round004_20261103_172012.npz",
+   "time": "2026-11-03 17:20:12"
   },
   {
    "x": [
@@ -137,8 +137,8 @@
     -0.1952260429302898
    ],
    "miss": 0.34726408242813783,
-   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round005_20261022_160405.npz",
-   "time": "2026-10-22 16:04:06"
+   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round005_20261103_172013.npz",
+   "time": "2026-11-03 17:20:13"
   },
   {
    "x": [
@@ -158,8 +158,8 @@
     0.1774274860654396
    ],
    "miss": 0.07049672651273874,
-   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round006_20261022_160406.npz",
-   "time": "2026-10-22 16:04:06"
+   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round006_20261103_172013.npz",
+   "time": "2026-11-03 17:20:13"
   },
   {
    "x": [
@@ -179,8 +179,8 @@
     0.307563475967859
    ],
    "miss": 0.16340655300379645,
-   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round007_20261022_160407.npz",
-   "time": "2026-10-22 16:04:07"
+   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round007_20261103_172014.npz",
+   "time": "2026-11-03 17:20:14"
   },
   {
    "x": [
@@ -200,8 +200,8 @@
     0.16682711710129838
    ],
    "miss": 0.023773421520231507,
-   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round008_20261022_160408.npz",
-   "time": "2026-10-22 16:04:08"
+   "record": "/home/spot/Documents/spotthrow/spot_throw_code (2)/spot_throw_code/twin_data/testopt_round008_20261103_172015.npz",
+   "time": "2026-11-03 17:20:15"
   }
  ]
 }
