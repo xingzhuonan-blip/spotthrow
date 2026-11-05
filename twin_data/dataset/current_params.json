@@ -1,0 +1,9 @@
+{
+  "accel_time": 0.35,
+  "coast_time": 0.45,
+  "brake_time": 0.35,
+  "speed_sh1": 2.12,
+  "speed_wr0": 0.58,
+  "brake_sh1": -0.9,
+  "open_time": 0.15
+}

@@ -308,7 +308,7 @@ def test_fast_throw():
     from throw_trajectory import check_trajectory
 
     space = FastThrowSpace(max_vel=2.5)
-    x = [-1.6, 1.4, -0.6, 2.0, -2.5, 1.0, 0.0]
+    x = [-1.2, 1.4, -0.6, 2.0, -2.5, 1.0, 0.0]  # windup stays above SH1_MIN
     T, rf, (t, pos, vel) = space.build(x)
     assert t[0] == 0 and abs(t[-1] - T) < 1e-9
     assert np.allclose(vel[0], 0) and np.allclose(vel[-1], 0), "must start and end at rest"
@@ -325,7 +325,7 @@ def test_fast_throw():
 
     fp = FastThrowPlanner(space)
     try:
-        plan = fp.plan([1.5, 0.0], sim_iters=3, n_starts=24)
+        plan = fp.plan([1.5, 0.0], n_starts=24)
         assert plan is not None, "no fast throw to 1.5 m at 2.5 rad/s"
         assert np.linalg.norm(np.subtract(plan["sim_landing"], [1.5, 0.0])) < 0.03, plan["sim_landing"]
         assert plan["release_speed"] >= 1.45 and plan["release_height"] >= 1.0, plan

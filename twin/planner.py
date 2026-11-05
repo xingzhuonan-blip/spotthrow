@@ -282,6 +282,12 @@ def save_plan(plan, path):
 
 def load_plan(path):
     d = json.loads(Path(path).read_text())
+    if d.get("kind") == "param":  # twin/param_throw.py: hand-set forward throw (dataset)
+        from .param_throw import ParamThrow
+        T, rf, traj = ParamThrow(**d["params"]).build()
+        d["duration"], d["release_fraction"] = T, rf
+        d.setdefault("gripper_delay", 0.25)
+        return d, traj
     if d.get("kind") == "fast":  # twin/fast_throw.py: windup / coast / brake profile
         from .fast_throw import FastThrowSpace
         space = {"release_at": "mid", **d["space"]}  # plans saved before 2026-11-03: mid-coast release

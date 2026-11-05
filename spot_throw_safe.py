@@ -253,7 +253,20 @@ class SpotThrows:
         if not ok:
             raise RuntimeError("Arm did not reach the start pose in time.")
 
-    def open_gripper(self):
+    # Release opening: as fast as the gripper allows (the robot caps these at
+    # its own limits). The default open is slow (~0.3 s from command to ball
+    # free), and the ball rattles in the half-open gripper meanwhile.
+    FAST_OPEN_VEL = 10.0   # rad/s
+    FAST_OPEN_ACC = 100.0  # rad/s^2
+
+    def open_gripper(self, fast=False):
+        if fast:
+            try:
+                self._command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command(
+                    max_vel=self.FAST_OPEN_VEL, max_acc=self.FAST_OPEN_ACC))
+                return
+            except (ResponseError, RpcError) as err:  # never keep the ball because of this
+                print(f"  (fast open refused: {err}; opening normally)")
         self._command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command())
 
     def close_gripper(self):
@@ -313,7 +326,7 @@ class SpotThrows:
             if sleep_for > 0:
                 time.sleep(sleep_for)
             release_cmd_time = time.time()
-            self.open_gripper()
+            self.open_gripper(fast=True)
             print(f"Gripper opened at t = {release_t:.2f} s.")
 
         arrived = block_until_arm_arrives(self._command_client, cmd_id, timeout_sec=T + 5.0)

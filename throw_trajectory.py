@@ -9,13 +9,18 @@ import numpy as np
 ARM_JOINT_NAMES = ("arm0.sh0", "arm0.sh1", "arm0.el0", "arm0.el1", "arm0.wr0", "arm0.wr1")
 JOINT_LIMITS = np.array([
     (-2.618, 3.141),   # sh0
-    (-3.141, 0.524),   # sh1
+    (-3.141, 0.524),   # sh1 (hardware); lower end tightened by SH1_MIN below
     (0.0, 3.141),      # el0
     (-2.793, 2.793),   # el1
     (-1.833, 1.833),   # wr0
     (-2.880, 2.880),   # wr1
 ])
 JOINT_LIMIT_MARGIN = 0.05
+# Keep the shoulder from swinging the arm back into the box mounted on Spot
+# (the windup reached -2.7 rad and hit it). Every planner and the pre-throw
+# check use JOINT_LIMITS, so this one number limits all of them.
+SH1_MIN = -2.3
+JOINT_LIMITS[1, 0] = SH1_MIN
 
 
 def cubic_joint_trajectory(start, end, T, dt=0.01):

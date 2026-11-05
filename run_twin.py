@@ -59,8 +59,8 @@ def trajectory_from(opts):
         opts.plan_gripper_delay = d["gripper_delay"]
         if opts.target is None:
             opts.target = d["target"]
-        print(f"plan {opts.plan}: T={opts.duration:.2f} s, release {opts.release_fraction:.2f}, "
-              f"target {np.round(opts.target, 3)}")
+        tgt = "none" if opts.target is None else np.round(opts.target, 3)
+        print(f"plan {opts.plan}: T={opts.duration:.2f} s, release {opts.release_fraction:.2f}, target {tgt}")
         return traj
     if opts.start_pose is None and opts.end_pose is None:
         return None
@@ -380,6 +380,22 @@ def cmd_throw(opts):
         ctl.stow_arm()
 
 
+def cmd_sit(opts):
+    """LAB: leave Spot free for other programs. If it is still powered on
+    (e.g. a throw was cut off), stow the arm, sit down and power off; then
+    return the lease. Does nothing else; if another program (tablet) holds
+    the lease it only says so."""
+    from bosdyn.client.lease import ResourceAlreadyClaimedError
+    opts.hostname, opts.external_estop = LAB["hostname"], True
+    print(f"Spot {opts.hostname}: sit down, power off, release the lease...")
+    try:
+        with spot_session(opts) as ctl:
+            if not ctl._robot.is_powered_on():
+                print("Spot is already powered off (sitting).")
+    except ResourceAlreadyClaimedError:
+        print("Another program (e.g. the tablet) holds the lease: nothing done, Spot is theirs.")
+
+
 def cmd_analyze(opts):
     for f in expand(opts.files):
         print(f)
@@ -611,6 +627,9 @@ def main():
     th.add_argument("--no-view", action="store_true", help="with --record: no real-time 3D window")
     th.add_argument("--dry-run", action="store_true", help="show what would run; nothing is sent to Spot")
     th.set_defaults(func=cmd_throw)
+
+    st = sub.add_parser("sit", help="LAB: Spot sits down, powers off and releases the lease")
+    st.set_defaults(func=cmd_sit)
 
     opts = parser.parse_args()
     opts.func(opts)

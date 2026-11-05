@@ -272,25 +272,30 @@ class FastThrowPlanner:
         T_world_robot = world_log_to_robot_frame(res["log"])[0]
         return transform_points(inv_T(T_world_robot), res["landing"][1][None])[0], res
 
-    def plan(self, target_xy, min_release_speed=1.5, sim_iters=3, tol=0.02, n_starts=24, verbose=False):
+    def plan(self, target_xy, min_release_speed=1.5, sim_iters=6, tol=0.02, n_starts=24, verbose=False):
         """Solve, check in physics (drag, gripper), shift the aim point by the
         error, re-solve. Returns a dict for save_fast_plan, or None."""
         target_xy = np.asarray(target_xy, float)
         aim = target_xy.copy()
-        x = sim_land = None
+        best = None  # (error, x, sim_land): the re-solve can jump between solutions, keep the best
         for k in range(sim_iters):
             x = self.solve(target_xy, n_starts=n_starts, min_release_speed=min_release_speed, aim_xy=aim)
             if x is None:
-                return None
+                break
             sim_land, _ = self.simulate(x)
             if sim_land is None:
-                return None
+                break
             err = sim_land[:2] - target_xy
             if verbose:
                 print(f"  physics check {k + 1}: lands {np.round(sim_land[:2], 3)}, error {np.linalg.norm(err) * 100:.1f} cm")
+            if best is None or np.linalg.norm(err) < best[0]:
+                best = (np.linalg.norm(err), x, sim_land)
             if np.linalg.norm(err) < tol:
                 break
             aim = aim - err
+        if best is None:
+            return None
+        _, x, sim_land = best
         return {"x": np.asarray(x).tolist(), "target": target_xy.tolist(),
                 "sim_landing": sim_land[:2].tolist(), **self.describe(x)}
 
