@@ -70,11 +70,13 @@ def trajectory_from(opts):
     return cubic_joint_trajectory(opts.start_pose, opts.end_pose, opts.duration)
 
 
-def save_record(rec, prefix, opts, i):
+def save_record(rec, prefix, opts, i, folder=None):
     if getattr(opts, "plan_gripper_delay", None) is not None:
         rec.params["plan_gripper_delay"] = opts.plan_gripper_delay  # viewer: planned flight
     name = f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_T{opts.duration}_rf{opts.release_fraction}_{i}.npz"
-    path = rec.save(DATA_DIR / name)
+    out = Path(folder) if folder else DATA_DIR
+    out.mkdir(parents=True, exist_ok=True)
+    path = rec.save(out / name)
     opts.last_record = path
     print(f"saved {path}")
     return print_analysis(rec)
@@ -306,6 +308,45 @@ def cmd_fast_plan(opts):
     print(f"exported {path}\n  simulate:  ./spot sim\n  on Spot:   ./spot throw   (both use the newest plan)")
 
 
+# Fixed cubic throw: overhand, straight ahead. Only the swing time and the
+# gripper release time are free (./spot cubic --time T --release R).
+CUBIC_START = [0.0, -2.2, 3.0, 0.0, 0.0, 1.57]
+CUBIC_END = [0.0, -1.24, 1.8, 0.0, 0.0, 1.57]
+
+
+def cmd_cubic(opts):
+    """Offline: fixed start -> end cubic swing; set the time and the release, export a plan."""
+    import json
+    from throw_trajectory import MAX_JOINT_ACC, MAX_JOINT_VEL, check_trajectory, cubic_joint_trajectory
+    T, R = opts.time, opts.release
+    src = opts.trajectory_from or max(glob.glob(str(DATA_DIR / "plans" / "plan_*.json")),
+                                      key=lambda f: Path(f).stat().st_mtime, default=None)
+    start, end = CUBIC_START, CUBIC_END
+    if src:  # the cubic trajectory used before: same start / end poses, new timing
+        old = json.loads(Path(src).read_text())
+        start, end = old["start_pose"], old["end_pose"]
+        print(f"trajectory (start/end poses) from {src}")
+    if T <= 0 or not (0.0 < R < T):
+        sys.exit(f"--release must be between 0 and --time ({T} s).")
+    traj = cubic_joint_trajectory(start, end, T)
+    d = np.abs(np.subtract(end, start))
+    print(f"cubic swing {T:.3f} s, gripper open sent at {R:.3f} s ({R / T:.0%} of the swing)")
+    print(f"  peak joint speed {1.5 * d.max() / T:.2f} rad/s (limit {MAX_JOINT_VEL}), "
+          f"peak acceleration {6 * d.max() / T**2:.1f} rad/s^2 (limit {MAX_JOINT_ACC})")
+    problems = check_trajectory(*traj, MAX_JOINT_VEL, MAX_JOINT_ACC)
+    if problems:
+        sys.exit("Too fast: " + "; ".join(problems) + "  -> use a longer --time")
+    path = DATA_DIR / "plans" / time.strftime("cubic_%Y%m%d_%H%M%S.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "target": None, "duration": T, "release_fraction": R / T,
+        "start_pose": [float(v) for v in start], "end_pose": [float(v) for v in end], "sim_landing": None,
+        "gripper_delay": opts.gripper_delay,
+        "space": {"max_vel": MAX_JOINT_VEL, "max_acc": MAX_JOINT_ACC},
+    }, indent=2))
+    print(f"exported {path}\n  simulate:  ./spot sim\n  on Spot:   ./spot throw   (both use the newest plan)")
+
+
 def latest_plan():
     files = glob.glob(str(DATA_DIR / "plans" / "*.json"))
     if not files:
@@ -316,7 +357,8 @@ def latest_plan():
 def plan_max_vel(path):
     """Joint speed limit the plan was made for (fast plans store it), else the lab default."""
     import json
-    return float(json.loads(Path(path).read_text()).get("space", {}).get("max_vel", 2.5))
+    from throw_trajectory import MAX_JOINT_VEL
+    return float(json.loads(Path(path).read_text()).get("space", {}).get("max_vel", MAX_JOINT_VEL))
 
 
 def cmd_sim(opts):
@@ -349,7 +391,8 @@ def cmd_throw(opts):
         setattr(opts, k, v)
     opts.multicast, opts.external_estop, opts.calib = False, True, str(CALIB_FILE)
     opts.max_vel = plan_max_vel(opts.plan) if opts.max_vel is None else opts.max_vel
-    opts.max_acc, opts.n, opts.ball = 10.0, 1, "tennis"
+    from throw_trajectory import MAX_JOINT_ACC
+    opts.max_acc, opts.n, opts.ball = MAX_JOINT_ACC, 1, "tennis"
     opts.target, opts.start_pose, opts.end_pose = None, None, None
     opts.duration, opts.release_fraction = 1.0, 0.5  # replaced by the plan
     print(f"Spot {opts.hostname}, joint limit {opts.max_vel} rad/s, e-stop: tablet / hardware")
@@ -621,12 +664,19 @@ def main():
 
     th = sub.add_parser("throw", help="LAB, short: throw the newest plan (or PLAN) on Spot, lab settings built in")
     th.add_argument("plan", nargs="?", help="plan file (default: newest in twin_data/plans)")
-    th.add_argument("--max-vel", type=float, help="joint speed limit (default: the plan's, else 2.5)")
+    th.add_argument("--max-vel", type=float, help="joint speed limit (default: the plan's, else 10)")
     th.add_argument("--record", action="store_true",
                     help="record with OptiTrack + live 3D window (Motive must be streaming)")
     th.add_argument("--no-view", action="store_true", help="with --record: no real-time 3D window")
     th.add_argument("--dry-run", action="store_true", help="show what would run; nothing is sent to Spot")
     th.set_defaults(func=cmd_throw)
+
+    cu = sub.add_parser("cubic", help="offline: fixed cubic throw; set swing time and release time")
+    cu.add_argument("--time", type=float, required=True, help="start -> end pose time (s)")
+    cu.add_argument("--release", type=float, required=True, help="gripper open sent at this time after start (s)")
+    cu.add_argument("--gripper-delay", type=float, default=0.1, help="simulation: open command -> ball free (s)")
+    cu.add_argument("--trajectory-from", help="plan whose start/end poses to use (default: newest plan_*.json)")
+    cu.set_defaults(func=cmd_cubic)
 
     st = sub.add_parser("sit", help="LAB: Spot sits down, powers off and releases the lease")
     st.set_defaults(func=cmd_sit)

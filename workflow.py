@@ -1,4 +1,4 @@
-"""Dataset loop: set the throw parameters -> throw forward on Spot -> the
+"""Dataset loop: set the swing time and gripper release time -> throw forward on Spot -> the
 landing distance (x) and the parameters go into a dataset.
 
   conda activate spotthrow
@@ -8,8 +8,8 @@ Spot is connected once at the start: it powers on, stands up and stays
 standing between throws (arm stowed), so you can throw again and again.
 q (or Ctrl+C) makes it sit down, power off and release the lease.
 
-The throw is always the same straight-forward swing (twin/param_throw.py);
-you change its timing / speeds / gripper open time before each throw.
+The throw is always the same straight-forward cubic swing (twin/cubic_throw.py);
+you change only its swing time and gripper release time before each throw.
 Dataset: twin_data/dataset/throws.csv (one row per throw).
 
   python workflow.py --fake    offline test with a simulated Spot + OptiTrack
@@ -35,9 +35,10 @@ SETTINGS = os.path.join(DSDIR, "current_params.json")
 THROW_FILE = os.path.join(DSDIR, "current_throw.json")
 PRED_DELAY = 0.25  # s, gripper delay used only for the simulated prediction ("c")
 
-from twin.param_throw import ParamThrow  # noqa: E402
+from throw_trajectory import MAX_JOINT_ACC, MAX_JOINT_VEL  # noqa: E402
+from twin.cubic_throw import CubicThrow as ParamThrow  # noqa: E402  (old 7-parameter throw: twin/param_throw.py)
 
-COLUMNS = ["id"] + ParamThrow.names() + ["landing_x"]  # throw number 1, 2, 3..., the 7 parameters, the result
+COLUMNS = ["id"] + ParamThrow.names() + ["landing_x"]  # throw number 1, 2, 3..., the settings, the result
 
 
 def load_params():
@@ -129,16 +130,24 @@ def throw(pt, lab):
     if lab["ctl"] is not None:
         time.sleep(1.0)
         lab["ctl"].stow_arm()  # back to the stowed arm; Spot keeps standing
+    # one folder per setting: twin_data/<ball>/T<swing time>_T<release time>/
+    opts.last_record = None
+    folder = os.path.join(DATA, opts.ball, f"T{pt.swing_time:g}_T{pt.release_time:g}")
     try:
-        R.save_record(rec, "live" if lab["ctl"] is not None else "fakelive", opts, 0)
+        R.save_record(rec, "live" if lab["ctl"] is not None else "fakelive", opts, 0, folder=folder)
     except Exception as err:  # the release analysis can fail when the ball is hidden; the landing still counts
         print(f"(release analysis skipped: {err})")
     from twin import ballistics
-    ml = ballistics.measured_landing(rec.ball_t, rec.ball_pos, rec.floor_z + rec.params["ball_radius"])
+    ground = rec.floor_z + rec.params["ball_radius"]
+    ml = ballistics.measured_landing(rec.ball_t, rec.ball_pos, ground)
+    how = "OptiTrack"
+    if ml is None:  # ball lost before the floor: continue the seen parabola down
+        ml = ballistics.extrapolated_landing(rec.ball_t, rec.ball_pos, ground)
+        how = "OptiTrack, last part of the fall extended along the seen parabola"
     row = pt.as_dict()
     if ml is not None:
         row["landing_x"] = round(float(ml[1][0]), 4)
-        print(f"\nLanding (OptiTrack): x = {row['landing_x']:.3f} m from Spot's body centre")
+        print(f"\nLanding ({how}): x = {row['landing_x']:.3f} m from Spot's body centre")
     else:
         print("\nOptiTrack did not see the landing.")
         x = ask_float("Measure it: type the landing x in metres (from Spot's body centre), or Enter to skip: ")
@@ -147,7 +156,24 @@ def throw(pt, lab):
             return
         row["landing_x"] = x
     append_row(row)
-    print(f"Added throw #{len(rows())} to {os.path.relpath(DATASET, HERE)}")
+    n = len(rows())
+    print(f"Added throw #{n} to {os.path.relpath(DATASET, HERE)}")
+    rec_path = getattr(opts, "last_record", None)
+    if rec_path:  # landing stored inside the record .npz (key "landing", a JSON string)
+        land = {"id": n, **pt.as_dict(), "landing_x": row["landing_x"],
+                "landing": None if ml is None else [round(float(v), 4) for v in ml[1]],
+                "landing_source": how if ml is not None else "measured by hand"}
+        add_landing(rec_path, land)
+        print(f"Saved trajectory + landing in {os.path.relpath(str(rec_path), HERE)}")
+
+
+def add_landing(npz_path, land):
+    """Put the landing dict into the record file. Read it back with
+    json.loads(str(np.load(path)["landing"]))."""
+    with np.load(npz_path, allow_pickle=False) as d:
+        data = {k: d[k] for k in d.files}
+    data["landing"] = json.dumps(land)
+    np.savez_compressed(npz_path, **data)
 
 
 def robot_status(ctl):
@@ -175,7 +201,7 @@ def lab_session(fake):
     """Context manager -> (robot interface, NatNet client, T_rb_body, rb id, ctl)."""
     import run_twin as R
     opts = SimpleNamespace(**R.LAB, multicast=False, external_estop=True, calib=str(R.CALIB_FILE),
-                           max_vel=2.5, max_acc=10.0, ball="tennis", n=1, target=None)
+                           max_vel=MAX_JOINT_VEL, max_acc=MAX_JOINT_ACC, ball="tennis", n=1, target=None)
     if fake:
         return opts, R.fake_lab(opts, ParamThrow().build()[2][1][0])
     return opts, R.real_lab(opts)
@@ -187,7 +213,7 @@ def menu(pt, lab):
         print(f"  dataset: {os.path.relpath(DATASET, HERE)} ({len(rows())} throws)   Spot: standing")
         show_params(pt)
         print("""
-  1-7  change a parameter (kept for the next throws)
+  1-2  change a setting   (kept for the next throws)
   t    THROW (Spot stays standing afterwards)   ** MOVES THE ARM **
   r    reset the parameters to the defaults
   q    quit: Spot sits down, powers off and releases the lease""")

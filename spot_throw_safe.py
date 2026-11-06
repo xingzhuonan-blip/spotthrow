@@ -60,8 +60,7 @@ ELBOW_START = START_POSE[2]
 ELBOW_END = np.pi / 2  # swing of ~76 degrees
 
 # Absolute caps we will never exceed, regardless of CLI flags.
-HARD_MAX_JOINT_VEL = 8.0   # rad/s
-HARD_MAX_JOINT_ACC = 20.0  # rad/s^2
+from throw_trajectory import MAX_JOINT_VEL as HARD_MAX_JOINT_VEL, MAX_JOINT_ACC as HARD_MAX_JOINT_ACC
 
 
 def elbow_traj(t: float, T: float) -> Tuple[float, float]:

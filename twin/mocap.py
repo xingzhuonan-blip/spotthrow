@@ -89,7 +89,79 @@ class BallTracker:
             p = self.step(t, cands, gripper_points[i])
             if p is not None:
                 out[i] = p
+        # The ball is often hidden in the gripper and first seen well away from
+        # it, so the gripper start can miss it. Prefer a track that flies under
+        # gravity (a parabola), found among all markers.
+        flight = find_flight(times, candidates)
+        if flight is not None:
+            return flight
         return out
+
+
+def _link_tracks(times, candidates, gate=0.10):
+    """Greedy nearest-neighbour linking of markers into tracks (constant
+    velocity prediction). Returns a list of (frame indices, points)."""
+    tracks, active = [], []
+    for i, (t, cs) in enumerate(zip(times, candidates)):
+        cs = np.asarray(cs, float).reshape(-1, 3)
+        used = set()
+        still = []
+        for tr in active:
+            if t - tr["t"][-1] > 0.05:  # lost for too long
+                continue
+            v = tr["v"] if len(tr["t"]) > 1 else np.zeros(3)
+            pred = tr["p"][-1] + v * (t - tr["t"][-1])
+            best, bd = None, gate
+            for k, c in enumerate(cs):
+                d = np.linalg.norm(c - pred)
+                if k not in used and d < bd:
+                    best, bd = k, d
+            if best is not None:
+                used.add(best)
+                dt = t - tr["t"][-1]
+                if dt > 0.002:
+                    tr["v"] = (cs[best] - tr["p"][-1]) / dt
+                tr["t"].append(t); tr["p"].append(cs[best]); tr["i"].append(i)
+            still.append(tr)
+        for k, c in enumerate(cs):
+            if k not in used:
+                tr = {"t": [t], "p": [c], "i": [i], "v": np.zeros(3)}
+                still.append(tr)
+                tracks.append(tr)
+        active = still
+    return [(np.array(tr["i"]), np.array(tr["p"])) for tr in tracks if len(tr["i"]) >= 8]
+
+
+def find_flight(times, candidates, g=9.81, tol=0.03, min_pts=10, min_travel=0.3):
+    """The ball's free flight: the longest marker track whose height follows
+    z = a + b t - g t^2 / 2 (within tol m) and that travels at least min_travel
+    m. Returns (n, 3) positions (NaN elsewhere) or None."""
+    times = np.asarray(times, float)
+    times = times - times[0] if len(times) else times  # live calls pass clock time (~1e9 s): t^2 fits break
+    best, best_n = None, 0
+
+    def fits(t, z):
+        A = np.c_[np.ones_like(t), t]
+        coef = np.linalg.lstsq(A, z + 0.5 * g * t ** 2, rcond=None)[0]
+        return np.abs(A @ coef - 0.5 * g * t ** 2 - z).max() < tol
+
+    for idx, pts in _link_tracks(times, candidates):
+        t = times[idx]
+        # a track can hold the flight plus a bounce / roll: take the longest
+        # stretch that is one parabola
+        for s0 in range(0, max(len(t) - min_pts, 0) + 1, 3):
+            e = s0 + min_pts
+            if e > len(t) or not fits(t[s0:e], pts[s0:e, 2]):
+                continue
+            while e < len(t) and fits(t[s0:e + 1], pts[s0:e + 1, 2]):
+                e += 1
+            if e - s0 > best_n and np.linalg.norm(pts[e - 1] - pts[s0]) >= min_travel:
+                best, best_n = (idx[s0:e], pts[s0:e]), e - s0
+    if best is None:
+        return None
+    out = np.full((len(times), 3), np.nan)
+    out[best[0]] = best[1]
+    return out
 
 
 def drop_static(candidates, radius=0.02, frac=0.8):

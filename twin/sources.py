@@ -50,7 +50,7 @@ def world_log_to_robot_frame(log):
 
 
 class SimSource:
-    def __init__(self, ball="tennis", gripper_delay=0.1, max_vel=8.0, max_acc=10.0, fly_time=2.0,
+    def __init__(self, ball="tennis", gripper_delay=0.1, max_vel=10.0, max_acc=100.0, fly_time=2.0,
                  optitrack=None):
         self.ball = ball
         self.gripper_delay = gripper_delay

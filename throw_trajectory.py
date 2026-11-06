@@ -22,6 +22,11 @@ JOINT_LIMIT_MARGIN = 0.05
 SH1_MIN = -2.3
 JOINT_LIMITS[1, 0] = SH1_MIN
 
+# Joint speed / acceleration caps for throws (raised 2026-11-06 for faster
+# throws; the gripper fast-open command already uses 10 rad/s, 100 rad/s^2).
+MAX_JOINT_VEL = 10.0   # rad/s
+MAX_JOINT_ACC = 100.0  # rad/s^2
+
 
 def cubic_joint_trajectory(start, end, T, dt=0.01):
     """All joints move from start to end with the same cubic timing (zero

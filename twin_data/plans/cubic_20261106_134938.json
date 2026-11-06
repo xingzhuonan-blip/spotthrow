@@ -1,0 +1,27 @@
+{
+  "target": null,
+  "duration": 0.6,
+  "release_fraction": 0.5,
+  "start_pose": [
+    -0.31631649231555325,
+    -2.2,
+    3.0,
+    0.0,
+    0.0,
+    1.57
+  ],
+  "end_pose": [
+    -0.31631649231555325,
+    -1.2435896923425065,
+    1.8,
+    0.0,
+    0.0,
+    1.57
+  ],
+  "sim_landing": null,
+  "gripper_delay": 0.1,
+  "space": {
+    "max_vel": 10.0,
+    "max_acc": 100.0
+  }
+}

@@ -56,6 +56,30 @@ def measured_landing(ball_t, ball_pos, ground_z):
     return t[i - 1] + a * (t[i] - t[i - 1]), x[i - 1] + a * (x[i] - x[i - 1])
 
 
+def extrapolated_landing(ball_t, ball_pos, ground_z, g=9.81):
+    """Where the seen flight would reach ground_z, for when the ball is lost
+    before the floor (cameras do not see the last part). Fits x, y linear and
+    z a parabola with gravity over the seen samples. -> (t, pos) or None."""
+    t, x = valid(ball_t, ball_pos)
+    if len(t) < 8:
+        return None
+    t0 = t[0]
+    t = t - t0
+    A = np.c_[np.ones_like(t), t]
+    cx = np.linalg.lstsq(A, x[:, 0], rcond=None)[0]
+    cy = np.linalg.lstsq(A, x[:, 1], rcond=None)[0]
+    cz = np.linalg.lstsq(A, x[:, 2] + 0.5 * g * t ** 2, rcond=None)[0]
+    # z(t) = cz0 + cz1 t - g t^2 / 2 = ground_z, later root
+    a, b, c = -0.5 * g, cz[1], cz[0] - ground_z
+    disc = b * b - 4 * a * c
+    if disc < 0:
+        return None
+    tl = max((-b + np.sqrt(disc)) / (2 * a), (-b - np.sqrt(disc)) / (2 * a))
+    if tl < t[-1]:
+        return None
+    return tl + t0, np.array([cx[0] + cx[1] * tl, cy[0] + cy[1] * tl, ground_z])
+
+
 def detect_release(ball_t, grip_dist, after_t, sep_m=0.02, noise_m=0.001):
     """Release time from the ball-to-gripper distance (see kinematics.py).
 
