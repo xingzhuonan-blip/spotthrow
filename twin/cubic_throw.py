@@ -15,7 +15,7 @@ import numpy as np
 
 from throw_trajectory import MAX_JOINT_ACC, MAX_JOINT_VEL, check_trajectory, cubic_joint_trajectory
 
-# Overhead arc like the fast throws run on 2026-11-05 (fastplan_20261105_152131.json):
+# Overhead arc like the fast throws run 
 # elbow straight (el0 0.05), shoulder sh1 and wrist wr0 swing together, sh0 = 0 so
 # the throw goes straight forward. sh1 starts at -2.2 (box limit is -2.3, margin 0.05).
 START_POSE = [0.0, -2.2, 0.05, 0.0, -1.43, 1.57]
