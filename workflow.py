@@ -31,6 +31,7 @@ sys.path.insert(0, HERE)
 DATA = os.path.join(HERE, "twin_data")
 DSDIR = os.path.join(DATA, "dataset")
 DATASET = os.path.join(DSDIR, "throws.csv")
+DATASET_FAKE = os.path.join(DSDIR, "throws_fake.csv")
 SETTINGS = os.path.join(DSDIR, "current_params.json")
 THROW_FILE = os.path.join(DSDIR, "current_throw.json")
 PRED_DELAY = 0.25  # s, gripper delay used only for the simulated prediction ("c")
@@ -49,32 +50,32 @@ def load_params():
         return ParamThrow()
 
 
-def save_params(pt):
+def save_params(pt: ParamThrow):
     os.makedirs(DSDIR, exist_ok=True)
     with open(SETTINGS, "w") as f:
         json.dump(pt.as_dict(), f, indent=2)
 
 
-def rows():
+def rows(dataset=DATASET):
     try:
-        with open(DATASET, newline="") as f:
+        with open(dataset, newline="") as f:
             return list(csv.DictReader(f))
     except OSError:
         return []
 
 
-def append_row(row):
+def append_row(row, dataset=DATASET):
     os.makedirs(DSDIR, exist_ok=True)
-    row = {**row, "id": len(rows()) + 1}
-    new = not os.path.exists(DATASET)
-    with open(DATASET, "a", newline="") as f:
+    row = {**row, "id": len(rows(dataset)) + 1}
+    new = not os.path.exists(dataset)
+    with open(dataset, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS)
         if new:
             w.writeheader()
         w.writerow({k: row.get(k, "") for k in COLUMNS})
 
 
-def show_params(pt):
+def show_params(pt: ParamThrow):
     T, rf, _ = pt.build()
     print(f"  throw parameters (motion {T:.2f} s, gripper open command at {rf * T:.2f} s):")
     for i, k in enumerate(ParamThrow.names(), 1):
@@ -107,7 +108,7 @@ def ask_float(prompt):
             print("Type a number in m, or just Enter.")
 
 
-def throw(pt, lab):
+def throw(pt:ParamThrow, lab):
     """One throw in the open session; Spot stays standing afterwards."""
     import run_twin as R
     probs = pt.problems()
@@ -155,9 +156,9 @@ def throw(pt, lab):
             print("Skipped: not added to the dataset.")
             return
         row["landing_x"] = x
-    append_row(row)
-    n = len(rows())
-    print(f"Added throw #{n} to {os.path.relpath(DATASET, HERE)}")
+    append_row(row, DATASET if lab["ctl"] is not None else DATASET_FAKE)
+    n = len(rows(DATASET if lab["ctl"] is not None else DATASET_FAKE))
+    print(f"Added throw #{n} to {os.path.relpath(DATASET if lab['ctl'] is not None else DATASET_FAKE, HERE)}")
     rec_path = getattr(opts, "last_record", None)
     if rec_path:  # landing stored inside the record .npz (key "landing", a JSON string)
         land = {"id": n, **pt.as_dict(), "landing_x": row["landing_x"],
@@ -207,10 +208,11 @@ def lab_session(fake):
     return opts, R.real_lab(opts)
 
 
-def menu(pt, lab):
+def menu(pt:ParamThrow, lab):
     while True:
         print("\n" + "=" * 70)
-        print(f"  dataset: {os.path.relpath(DATASET, HERE)} ({len(rows())} throws)   Spot: standing")
+        dataset = DATASET if lab["ctl"] is not None else DATASET_FAKE
+        print(f"  dataset: {os.path.relpath(dataset, HERE)} ({len(rows(dataset))} throws)   Spot: standing")
         show_params(pt)
         print("""
   1-2  change a setting   (kept for the next throws)
