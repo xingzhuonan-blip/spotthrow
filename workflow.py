@@ -39,7 +39,9 @@ PRED_DELAY = 0.25  # s, gripper delay used only for the simulated prediction ("c
 from throw_trajectory import MAX_JOINT_ACC, MAX_JOINT_VEL  # noqa: E402
 from twin.cubic_throw import CubicThrow as ParamThrow  # noqa: E402  (old 7-parameter throw: twin/param_throw.py)
 
-COLUMNS = ["id"] + ParamThrow.names() + ["landing_x"]  # throw number 1, 2, 3..., the settings, the result
+# throw number 1, 2, 3..., the settings, the result; target_x / error_x only when the
+# settings came from the GP ("g" in the menu): error_x = landing_x - target_x
+COLUMNS = ["id"] + ParamThrow.names() + ["landing_x", "target_x", "error_x"]
 
 
 def load_params():
@@ -66,7 +68,14 @@ def rows(dataset=DATASET):
 
 def append_row(row, dataset=DATASET):
     os.makedirs(DSDIR, exist_ok=True)
-    row = {**row, "id": len(rows(dataset)) + 1}
+    old = rows(dataset)
+    row = {**row, "id": len(old) + 1}
+    if old and list(old[0].keys()) != COLUMNS:  # older file without the target columns: add them
+        with open(dataset, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=COLUMNS)
+            w.writeheader()
+            for r in old:
+                w.writerow({k: r.get(k) or "" for k in COLUMNS})
     new = not os.path.exists(dataset)
     with open(dataset, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS)
@@ -156,12 +165,16 @@ def throw(pt:ParamThrow, lab):
             print("Skipped: not added to the dataset.")
             return
         row["landing_x"] = x
+    if lab.get("target") is not None:
+        row["target_x"] = lab["target"]
+        row["error_x"] = round(row["landing_x"] - lab["target"], 4)
+        print(f"Target {lab['target']:.3f} m -> error {row['error_x']:+.3f} m")
     append_row(row, DATASET if lab["ctl"] is not None else DATASET_FAKE)
     n = len(rows(DATASET if lab["ctl"] is not None else DATASET_FAKE))
     print(f"Added throw #{n} to {os.path.relpath(DATASET if lab['ctl'] is not None else DATASET_FAKE, HERE)}")
     rec_path = getattr(opts, "last_record", None)
     if rec_path:  # landing stored inside the record .npz (key "landing", a JSON string)
-        land = {"id": n, **pt.as_dict(), "landing_x": row["landing_x"],
+        land = {"id": n, **pt.as_dict(), "landing_x": row["landing_x"], "target_x": lab.get("target"),
                 "landing": None if ml is None else [round(float(v), 4) for v in ml[1]],
                 "landing_source": how if ml is not None else "measured by hand"}
         add_landing(rec_path, land)
@@ -208,20 +221,48 @@ def lab_session(fake):
     return opts, R.real_lab(opts)
 
 
+def gp_target(pt, lab, dataset):
+    """Ask a target distance, retrain the GP on the dataset, set the two times."""
+    target = ask_float("Target distance x in metres (Enter = cancel): ")
+    if target is None:
+        return pt
+    from twin.gp_inverse import suggest
+    print(f"Training the GP on {os.path.relpath(dataset, HERE)} ...")
+    ok = lambda s, r: not ParamThrow(swing_time=s, release_time=r).problems()
+    res, msg = suggest(dataset, target, feasible=ok)
+    print("  " + msg)
+    if res is None:
+        return pt
+    new = ParamThrow(swing_time=round(res["swing_time"], 4), release_time=round(res["release_time"], 4))
+    print(f"  GP: swing_time {new.swing_time} s, release_time {new.release_time} s -> predicted "
+          f"{res['predicted']:.3f} m (+/- {res['std']:.3f})")
+    if not res["sure"]:
+        print("  (the GP is not sure here: std above the wanted 0.05 m; more throws near this setting help)")
+    save_params(new)
+    lab["target"] = target
+    return new
+
+
 def menu(pt:ParamThrow, lab):
     while True:
         print("\n" + "=" * 70)
         dataset = DATASET if lab["ctl"] is not None else DATASET_FAKE
         print(f"  dataset: {os.path.relpath(dataset, HERE)} ({len(rows(dataset))} throws)   Spot: standing")
         show_params(pt)
+        if lab.get("target") is not None:
+            print(f"  target: {lab['target']:.3f} m (settings from the GP)")
         print("""
-  1-2  change a setting   (kept for the next throws)
+  g    target distance: GP (retrained on the dataset) sets the two times
+  1-2  change a setting by hand (clears the target)
   t    THROW (Spot stays standing afterwards)   ** MOVES THE ARM **
   r    reset the parameters to the defaults
   q    quit: Spot sits down, powers off and releases the lease""")
         c = input("> ").strip().lower()
         if c.isdigit() and 1 <= int(c) <= len(ParamThrow.names()):
             edit(pt, int(c) - 1)
+            lab["target"] = None
+        elif c == "g":
+            pt = gp_target(pt, lab, dataset)
         elif c == "t":
             try:
                 throw(pt, lab)
@@ -232,6 +273,7 @@ def menu(pt:ParamThrow, lab):
         elif c == "r":
             pt = ParamThrow()
             save_params(pt)
+            lab["target"] = None
         elif c == "q":
             return
 

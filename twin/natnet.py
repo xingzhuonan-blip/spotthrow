@@ -68,7 +68,10 @@ class MocapFrame:
 
     def unlabeled(self):
         """Positions of markers that belong to no rigid body: ball candidates."""
-        pts = [m.pos for m in self.markers if m.model_id == 0 and not m.occluded]
+        # Unlabeled markers usually have model_id 0, but Motive can also stream
+        # them under another asset id (seen 2026-11-13: model_id 4). So: every
+        # marker that is not part of a streamed rigid body.
+        pts = [m.pos for m in self.markers if m.model_id not in self.rigid_bodies and not m.occluded]
         if not pts and not self.markers:  # very old servers: only the legacy list
             pts = list(self.other_markers)
         return pts

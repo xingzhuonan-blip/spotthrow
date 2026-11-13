@@ -132,31 +132,44 @@ def _link_tracks(times, candidates, gate=0.10):
     return [(np.array(tr["i"]), np.array(tr["p"])) for tr in tracks if len(tr["i"]) >= 8]
 
 
-def find_flight(times, candidates, g=9.81, tol=0.03, min_pts=10, min_travel=0.3):
-    """The ball's free flight: the longest marker track whose height follows
-    z = a + b t - g t^2 / 2 (within tol m) and that travels at least min_travel
-    m. Returns (n, 3) positions (NaN elsewhere) or None."""
+def find_flight(times, candidates, g=9.81, tol=0.03, min_pts=10, min_travel=0.3, min_drop=0.3):
+    """The ball's first free flight (from the hand to the first floor contact).
+
+    Marker tracks are cut into stretches whose height follows
+    z = a + b t - g t^2 / 2 (within tol m) and that travel at least min_travel
+    m. A bounce is also a parabola, but it starts on the floor; the first
+    flight starts high and ends low. So: the EARLIEST stretch that falls at
+    least min_drop m from its start (the longest stretch if none does).
+    Returns (n, 3) positions (NaN elsewhere) or None."""
     times = np.asarray(times, float)
     times = times - times[0] if len(times) else times  # live calls pass clock time (~1e9 s): t^2 fits break
-    best, best_n = None, 0
 
     def fits(t, z):
         A = np.c_[np.ones_like(t), t]
         coef = np.linalg.lstsq(A, z + 0.5 * g * t ** 2, rcond=None)[0]
         return np.abs(A @ coef - 0.5 * g * t ** 2 - z).max() < tol
 
+    stretches = []  # (frame indices, points)
     for idx, pts in _link_tracks(times, candidates):
         t = times[idx]
-        # a track can hold the flight plus a bounce / roll: take the longest
-        # stretch that is one parabola
-        for s0 in range(0, max(len(t) - min_pts, 0) + 1, 3):
+        s0 = 0
+        while s0 <= len(t) - min_pts:
             e = s0 + min_pts
-            if e > len(t) or not fits(t[s0:e], pts[s0:e, 2]):
+            if not fits(t[s0:e], pts[s0:e, 2]):
+                s0 += 1
                 continue
             while e < len(t) and fits(t[s0:e + 1], pts[s0:e + 1, 2]):
                 e += 1
-            if e - s0 > best_n and np.linalg.norm(pts[e - 1] - pts[s0]) >= min_travel:
-                best, best_n = (idx[s0:e], pts[s0:e]), e - s0
+            if np.linalg.norm(pts[e - 1] - pts[s0]) >= min_travel:
+                stretches.append((idx[s0:e], pts[s0:e]))
+            s0 = e  # next stretch starts after this one
+    falling = [st for st in stretches if st[1][0, 2] - st[1][:, 2].min() >= min_drop]
+    if falling:
+        best = min(falling, key=lambda st: times[st[0][0]])
+    elif stretches:
+        best = max(stretches, key=lambda st: len(st[0]))
+    else:
+        best = None
     if best is None:
         return None
     out = np.full((len(times), 3), np.nan)

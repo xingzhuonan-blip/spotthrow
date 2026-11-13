@@ -22,6 +22,20 @@ START_POSE = [0.0, -2.2, 0.05, 0.0, -1.43, 1.57]
 END_POSE = [0.0, -0.52, 0.05, 0.0, 0.30, 1.57]
 
 
+# Earliest gripper release that still throws (measured 2026-11-13): an earlier
+# release lets the ball go while the arm still lifts, it flies up, lands on
+# Spot and bounces off. Limit = fraction x swing_time: 0.28 up to a 0.9 s
+# swing, rising to 0.36 at 1.0 s (a slow swing needs a later release).
+RELEASE_FRAC_FAST, RELEASE_FRAC_SLOW = 0.28, 0.36
+SLOW_FROM, SLOW_AT = 0.9, 1.0
+
+
+def min_release(swing_time):
+    """Earliest release_time (s) that throws normally for this swing_time."""
+    a = np.clip((swing_time - SLOW_FROM) / (SLOW_AT - SLOW_FROM), 0.0, 1.0)
+    return (RELEASE_FRAC_FAST + a * (RELEASE_FRAC_SLOW - RELEASE_FRAC_FAST)) * swing_time
+
+
 @dataclass
 class CubicThrow:
     swing_time: float = 0.60
@@ -50,6 +64,9 @@ class CubicThrow:
             return ["swing_time too short"]
         if not 0.0 <= self.release_time <= self.swing_time:
             return ["release_time must be between 0 and swing_time"]
+        lo = min_release(self.swing_time)
+        if self.release_time < lo - 1e-9:
+            return [f"release_time below {lo:.3f} s for a {self.swing_time:g} s swing: the ball goes up and lands on Spot"]
         return list(check_trajectory(*self.build()[2], max_vel, max_acc))
 
     def to_plan(self, gripper_delay=0.25, max_vel=MAX_JOINT_VEL, max_acc=MAX_JOINT_ACC):

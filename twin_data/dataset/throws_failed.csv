@@ -1,0 +1,7 @@
+id,swing_time,release_time,landing_x,target_x,error_x,note
+7,0.9,0.18,0.7167,,,"failed: ball went up, landed on Spot"
+16,0.8,0.16,0.9104,,,"failed: ball went up, landed on Spot"
+23,0.7,0.16,1.8025,,,"failed: ball went up, landed on Spot"
+34,1.0,0.3,1.3886,,,"failed: ball went up, landed on Spot"
+42,0.6,0.15,2.4816,,,"failed: ball went up, landed on Spot"
+50,0.73,0.1636,2.1085,1.5,0.6085,"failed: ball went up, landed on Spot"
